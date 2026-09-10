@@ -132,4 +132,3 @@ npm test
 ```
 
 构建产物位于 `bin/`，不纳入源码提交。问题背景见 [研究记录](docs/research.md)；[v1 验收记录](docs/validation.md) 只代表旧版本结果。v2 的 CLI、生命周期与 worker 性能结果统一记录在 [v2 验收记录](docs/validation-v2.md)，不能把旧版测试数字当作新版结论。
-# CopilotImageProxy
