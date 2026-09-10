@@ -1,0 +1,5 @@
+node_modules/
+.run/
+config.json
+*.log
+bin/

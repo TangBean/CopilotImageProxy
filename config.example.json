@@ -1,0 +1,14 @@
+{
+  "host": "127.0.0.1",
+  "port": 4142,
+  "upstream": "http://127.0.0.1:4141",
+  "maxEdge": 1280,
+  "jpegQuality": 80,
+  "maxOutputMiB": 24,
+  "maxInputMiB": 128,
+  "cacheMiB": 64,
+  "imageConcurrency": 2,
+  "connectTimeoutMs": 10000,
+  "upstreamStartupTimeoutMs": 180000,
+  "maxImageQueueMiB": 256
+}
