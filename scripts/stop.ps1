@@ -5,7 +5,7 @@ $ErrorActionPreference = 'Stop'
 $projectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $runDirectory = Join-Path $projectRoot '.run'
 $statePath = Join-Path $runDirectory 'service.json'
-$managerPath = Join-Path $projectRoot 'bin\JobHost.exe'
+$binDirectory = Join-Path $projectRoot 'bin'
 $lockHandle = $null
 $manager = $null
 try {
@@ -14,7 +14,9 @@ try {
     $lockHandle = [IO.File]::Open((Join-Path $runDirectory 'lifecycle.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
     if (-not (Test-Path -LiteralPath $statePath)) { Write-Output 'No managed service is recorded.'; return }
     $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
-    if (-not [string]::Equals([string]$state.managerPath, $managerPath, [StringComparison]::OrdinalIgnoreCase)) { throw 'The recorded manager does not belong to this project.' }
+    $managerPath = [IO.Path]::GetFullPath([string]$state.managerPath)
+    if (-not [string]::Equals([IO.Path]::GetDirectoryName($managerPath), $binDirectory, [StringComparison]::OrdinalIgnoreCase) -or
+        [IO.Path]::GetFileName($managerPath) -notmatch '^JobHost(?:\.[a-f0-9]{64})?\.exe$') { throw 'The recorded manager does not belong to this project.' }
     $manager = Get-Process -Id ([int]$state.managerPid) -ErrorAction SilentlyContinue
     if ($null -eq $manager) { Remove-Item -LiteralPath $statePath; Write-Output 'Manager already exited; stale state removed.'; return }
     $null = $manager.Handle

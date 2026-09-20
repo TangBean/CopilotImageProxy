@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import { LOG_LEVELS } from './logging.mjs';
 
 export const DEFAULT_CONFIG = Object.freeze({
   host: '127.0.0.1', port: 4142, upstream: 'http://127.0.0.1:4141',
@@ -6,6 +7,7 @@ export const DEFAULT_CONFIG = Object.freeze({
   cacheMiB: 64, imageConcurrency: 2, connectTimeoutMs: 10000,
   upstreamStartupTimeoutMs: 180000,
   maxImageQueueMiB: 256,
+  logLevel: 'info',
 });
 
 const loopback = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
@@ -18,6 +20,7 @@ export function validateConfig(overrides = {}, { managedUpstream = false, skipUp
     if (!Object.hasOwn(DEFAULT_CONFIG, key)) throw new Error(`Unknown configuration key: ${key}`);
   }
   const config = { ...DEFAULT_CONFIG, ...overrides };
+  if (!LOG_LEVELS.includes(config.logLevel)) throw new Error(`logLevel must be one of: ${LOG_LEVELS.join(', ')}.`);
   if (!['127.0.0.1', 'localhost', '::1'].includes(config.host)) throw new Error('host must be a loopback address.');
   const integer = (key, min, max) => {
     if (!Number.isInteger(config[key]) || config[key] < min || config[key] > max) {

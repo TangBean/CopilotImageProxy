@@ -1,4 +1,5 @@
-import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { writeFile, mkdir } from 'node:fs/promises';
+import { readImageSample } from './image-sample.mjs';
 import { dirname, resolve } from 'node:path';
 
 const [rollout, reportPath, baseUrl = 'http://127.0.0.1:4142'] = process.argv.slice(2);
@@ -6,18 +7,7 @@ if (!rollout || !reportPath) {
   process.stderr.write('Usage: node scripts/validate-tool-roundtrip.mjs rollout.jsonl report.json [proxy-url]\n');
   process.exit(1);
 }
-const images = [];
-for (const line of (await readFile(rollout, 'utf8')).split('\n')) {
-  if (!line.trim()) continue;
-  const row = JSON.parse(line);
-  if (row.type !== 'response_item') continue;
-  const item = row.payload;
-  const parts = item.type === 'message' ? item.content :
-    ['custom_tool_call_output', 'function_call_output'].includes(item.type) ? item.output : null;
-  if (Array.isArray(parts)) for (const part of parts) {
-    if (part.type === 'input_image' && part.image_url?.startsWith('data:image/')) images.push(part);
-  }
-}
+const { images } = await readImageSample(rollout, 1);
 const tool = { type: 'function', name: 'proxy_read_preview',
   description: 'Return an existing saved Blender preview image from this test. This is a read-only tool.',
   parameters: { type: 'object', properties: {}, additionalProperties: false }, strict: true };
@@ -46,7 +36,7 @@ async function request(name, choice) {
   await save(); return response;
 }
 try {
-  const first = await request('production_18_images_tool_call', { type: 'function', name: tool.name });
+  const first = await request('sample_images_tool_call', { type: 'function', name: tool.name });
   const calls = first.output.filter((item) => item.type === 'function_call');
   if (calls.length !== 1 || calls[0].name !== tool.name || Object.keys(JSON.parse(calls[0].arguments)).length) {
     throw new Error('Unexpected function call; no tool was executed.');

@@ -8,10 +8,15 @@ import { DEFAULT_CONFIG, loadConfig, validateConfig } from '../src/config.mjs';
 test('configuration preserves defaults and validates quality and routing before startup', () => {
   assert.deepEqual(validateConfig(), DEFAULT_CONFIG);
   assert.equal(validateConfig({ jpegQuality: 90 }).jpegQuality, 90);
+  assert.equal(validateConfig().logLevel, 'info');
+  for (const logLevel of ['debug', 'info', 'warn', 'error', 'silent']) {
+    assert.equal(validateConfig({ logLevel }).logLevel, logLevel);
+  }
   for (const invalid of [{ jpegQuality: 101 }, { maxEdge: 0 }, { imageConcurrency: 0 },
     { maxOutputMiB: 0 }, { maxInputMiB: Infinity }, { cacheMiB: -1 }, { port: 4141 },
     { host: '0.0.0.0' }, { upstream: 'http://example.com' }, { upstream: 'http://secret@localhost:4141' },
-    { upstream: 'http://localhost:4142' }, { typoQuality: 90 }, null, []]) {
+    { upstream: 'http://localhost:4142' }, { typoQuality: 90 }, { logLevel: 'verbose' },
+    { logLevel: null }, { logLevel: 0 }, null, []]) {
     assert.throws(() => validateConfig(invalid));
   }
 });

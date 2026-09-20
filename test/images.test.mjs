@@ -483,6 +483,21 @@ test('cancellation drops queued image work and does not modify the cancelled pay
   processor.close();
 });
 
+test('late cancellation leaves cached and pending images unchanged together', async (t) => {
+  const processor = createImageProcessor({ imageConcurrency: 1 });
+  t.after(() => processor.close());
+  const cached = dataUrl(await noisePng());
+  const pending = dataUrl(await noisePng(800, 400, 7));
+  await processor.transformPayload(message(cached));
+  const payload = message(cached, pending);
+  const original = structuredClone(payload);
+  const controller = new AbortController();
+  const processing = processor.transformPayload(payload, { signal: controller.signal });
+  controller.abort();
+  await assert.rejects(processing, { name: 'AbortError' });
+  assert.deepEqual(payload, original);
+});
+
 test('passes non-object JSON and unrecognized payload shapes unchanged', async () => {
   const processor = createImageProcessor();
   for (const payload of [null, 7, false, 'text', [], {}, { input: 'hello' }, { input: [null, 'text', {}] }]) {

@@ -86,7 +86,8 @@ Invoke-RestMethod 'http://127.0.0.1:4142/healthz'
   "imageConcurrency": 2,
   "connectTimeoutMs": 10000,
   "upstreamStartupTimeoutMs": 180000,
-  "maxImageQueueMiB": 256
+  "maxImageQueueMiB": 256,
+  "logLevel": "info"
 }
 ```
 
@@ -102,6 +103,7 @@ Invoke-RestMethod 'http://127.0.0.1:4142/healthz'
 | `connectTimeoutMs` | 建立上游连接的超时，默认 10 秒；不限制整次推理或 SSE 的读取时长。 |
 | `upstreamStartupTimeoutMs` | 等待 copilot-api 就绪的时限，默认 180 秒。 |
 | `maxImageQueueMiB` | 图片候选请求的 worker 队列容量预算，默认 256 MiB；满时本地返回 503，不发送上游。 |
+| `logLevel` | 代理日志最低级别，默认 `info`；支持 `debug`、`info`、`warn`、`error`、`silent`，修改后手动重启生效。 |
 
 **24 MiB 是本项目选择的预算，不是 GitHub 公布的请求限制。** 超限时返回 `413 / proxy_payload_budget_exceeded` 和字节统计，且上游请求次数为零。代理不删图，不继续降低画质。可以提前整理上下文，或显式调整画质和预算。
 
@@ -116,7 +118,19 @@ Invoke-RestMethod 'http://127.0.0.1:4142/healthz'
 - 支持解压 zstd、gzip 和 deflate 入站请求，向上游发送普通 JSON 并更新长度、编码相关 headers。其他路由按字节流透传。
 - SSE 及时逐块转发；客户端取消会取消对应上游请求。上游 HTTP 错误透传，每个入站请求最多发出一次上游请求。Codex 自身的重试仍可能产生新的入站请求。
 
-代理自身日志只写请求类型、字节数、处理计数、耗时和状态等元数据。后台日志也会收录官方 CLI 的原始 stdout/stderr；这部分内容由上游命令及其日志选项决定。
+代理自身日志只写请求类型、字节数、处理计数、耗时和状态等元数据。默认 `logLevel: "info"` 只输出启动、停止和简短异常：正常请求、健康检查、客户端断开以及完整图片/缓存统计只在 `debug` 级别显示。HTTP 4xx 使用 `warn`，HTTP 5xx、上游流异常和内部错误使用 `error`。`warn` / `error` 可进一步减少日志，`silent` 关闭代理自己的结构化日志。
+
+调试时将 `config.json` 的 `logLevel` 改为 `debug` 后手动重启，可以恢复完整 JSON 请求统计。`status: 200` 仅代表收到响应头，不保证流完整结束；`abortSource` 记录代理首先观察到的断开来源（`client`、`upstream` 或 `proxy`），不代表网络故障根因。客户端断开后清理上游连接产生的事件不会再误记为上游错误。`durationMs` 是整个请求的耗时，不是图片编码耗时。
+
+后台日志也会收录官方 CLI 的原始 stdout/stderr；这部分内容由上游命令及其日志选项决定，代理的 `logLevel` 不会过滤它。准备好后，在原来启动服务的工作目录及代理环境中打开 PowerShell，手动重启受管的两个服务：
+
+```powershell
+& 'D:\Codes\Github\CopilotImageProxy\scripts\stop.ps1'
+# 等停止命令成功结束后，再执行启动。
+& 'D:\Codes\Github\CopilotImageProxy\scripts\start.ps1' -CopilotArgs @('start', '--proxy-env')
+```
+
+启动时会重新确认 npm `latest`，原 copilot-api 包保持不修改。前台运行可在原终端按 `Ctrl+C`，退出后重新执行 `copilot-image-proxy`。
 
 ## 从 v1 迁移、接入与验证
 
@@ -132,3 +146,7 @@ npm test
 ```
 
 构建产物位于 `bin/`，不纳入源码提交。问题背景见 [研究记录](docs/research.md)；[v1 验收记录](docs/validation.md) 只代表旧版本结果。v2 的 CLI、生命周期与 worker 性能结果统一记录在 [v2 验收记录](docs/validation-v2.md)，不能把旧版测试数字当作新版结论。
+
+## 验收脚本输入
+
+`scripts/validate-sample.mjs` 和 `scripts/validate-tool-roundtrip.mjs` 要求 rollout 至少包含 1 张内嵌图片；`scripts/validate-live.mjs` 的追加图片场景要求至少 2 张。脚本只读取 `response_item` 中消息及工具结果的 `input_image`，不重复统计 UI 镜像。样本不足或 JSONL 损坏时立即失败，不发送模型请求；无图片样本不能作为图片代理验收通过的证据。

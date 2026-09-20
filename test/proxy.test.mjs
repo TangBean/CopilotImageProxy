@@ -7,10 +7,31 @@ import test from 'node:test';
 import sharp from 'sharp';
 import { DEFAULT_CONFIG } from '../src/config.mjs';
 import { createProxyServer } from '../src/server.mjs';
+import { createLogger } from '../src/logging.mjs';
 import { VERSION } from '../src/version.mjs';
 
 const TEST_TIMEOUT = 10_000;
 const MiB = 1024 * 1024;
+
+test('forwards Responses SSE bytes and upstream accounting headers unchanged', { timeout: TEST_TIMEOUT }, async (t) => {
+  const event = 'event: response.completed\ndata: {"type":"response.completed","response":{"usage":{"input_tokens":692,"output_tokens":5,"total_tokens":697}}}\n\n';
+  const payload = '{ "model": "gpt-6-astra", "stream": true, "input": [] }';
+  for (const value of [undefined, 'true', 'false']) {
+    const env = await setup(t, {
+      handle: (_req, res) => {
+        const headers = { 'content-type': 'text/event-stream; charset=utf-8' };
+        if (value !== undefined) headers['x-reasoning-included'] = value;
+        res.writeHead(200, headers); res.end(event);
+      },
+    });
+    for (const path of ['/responses', '/v1/responses?trace=test']) {
+      const result = await send(env.url, { path, body: payload });
+      assert.equal(result.headers['x-reasoning-included'], value);
+      assert.equal(result.body.toString(), event);
+      assert.equal(env.requests.at(-1).body.toString(), payload);
+    }
+  }
+});
 
 async function listen(server) {
   server.listen(0, '127.0.0.1');
@@ -34,6 +55,8 @@ async function readBody(stream) {
 async function setup(t, { config = {}, handle } = {}) {
   const requests = [];
   const logs = [];
+  let resolveFirstLog;
+  const firstLog = new Promise((resolve) => { resolveFirstLog = resolve; });
   const upstream = http.createServer(async (req, res) => {
     try {
       const entry = { method: req.method, url: req.url, headers: req.headers, body: await readBody(req) };
@@ -50,13 +73,12 @@ async function setup(t, { config = {}, handle } = {}) {
   });
   const upstreamUrl = await listen(upstream);
   t.after(() => stop(upstream));
-  const proxy = createProxyServer({
-    config: { ...DEFAULT_CONFIG, host: '127.0.0.1', port: 4142, upstream: upstreamUrl, ...config },
-    log: (entry) => logs.push(entry),
-  });
+  const proxyConfig = { ...DEFAULT_CONFIG, logLevel: 'debug', host: '127.0.0.1', port: 4142, upstream: upstreamUrl, ...config };
+  const log = createLogger({ level: proxyConfig.logLevel, write: (entry) => { logs.push(entry); resolveFirstLog(entry); } });
+  const proxy = createProxyServer({ config: proxyConfig, log });
   const url = await listen(proxy);
   t.after(() => stop(proxy));
-  return { proxy, upstream, url, upstreamUrl, requests, logs };
+  return { proxy, upstream, url, upstreamUrl, requests, logs, firstLog };
 }
 
 function send(url, { method = 'POST', path = '/responses', headers = {}, body = '' } = {}) {
@@ -343,7 +365,13 @@ test('destroys the upstream response when the client cancels an SSE stream', { t
     upstreamClosed,
     delay(2000, undefined, { ref: false }).then(() => { throw new Error('The upstream stream remained open after client cancellation'); }),
   ]);
+  await env.firstLog;
   assert.equal(env.requests.length, 1);
+  assert.equal(env.logs.length, 1);
+  assert.equal(env.logs[0].level, 'debug');
+  assert.equal(env.logs[0].abortSource, 'client');
+  assert.equal(env.logs[0].aborted, true);
+  assert.equal(env.logs[0].error, undefined);
 });
 
 test('does not reuse its connect timeout as an SSE read timeout', { timeout: TEST_TIMEOUT }, async (t) => {
@@ -361,7 +389,7 @@ test('does not reuse its connect timeout as an SSE read timeout', { timeout: TES
 
 test('propagates an interrupted upstream stream without appending a JSON error', { timeout: TEST_TIMEOUT }, async (t) => {
   const first = 'data: partial-upstream-output\n\n';
-  const env = await setup(t, { handle: async (_req, res) => {
+  const env = await setup(t, { config: { logLevel: 'info' }, handle: async (_req, res) => {
     res.writeHead(200, { 'content-type': 'text/event-stream' });
     res.write(first);
     await delay(30);
@@ -382,7 +410,32 @@ test('propagates an interrupted upstream stream without appending a JSON error',
   assert.equal(result.status, 200);
   assert.equal(result.complete, false);
   assert.equal(result.text, first);
+  await env.firstLog;
   assert.equal(env.requests.length, 1);
+  assert.equal(env.logs.length, 1);
+  assert.equal(env.logs[0].level, 'error');
+  assert.equal(env.logs[0].abortSource, 'upstream');
+  assert.equal(env.logs[0].error, 'proxy_upstream_stream_aborted');
+  assert.equal(env.logs[0].status, 200);
+  assert.equal(env.logs[0].aborted, true);
+});
+
+test('default logging hides successful requests and health checks but keeps compact failures', { timeout: TEST_TIMEOUT }, async (t) => {
+  const env = await setup(t, { config: { logLevel: DEFAULT_CONFIG.logLevel, maxOutputMiB: 0.001 } });
+  assert.equal((await send(env.url, { body: '{"input":"input_image candidate"}' })).status, 200);
+  assert.equal((await send(env.url, { method: 'GET', path: '/healthz' })).status, 200);
+  assert.equal(env.logs.length, 0);
+  const result = await send(env.url, { body: JSON.stringify({ input: 'input_image ' + 'x'.repeat(4096) }) });
+  assert.equal(result.status, 413);
+  assert.equal(env.logs.length, 1);
+  const [entry] = env.logs;
+  assert.equal(entry.level, 'warn');
+  assert.equal(entry.error, 'proxy_payload_budget_exceeded');
+  assert.equal(entry.upstreamRequests, 0);
+  assert.equal(entry.images, undefined);
+  assert.equal(entry.imageFastPath, undefined);
+  assert.ok(entry.outputBytes > 1024);
+  assert.ok(entry.requestId);
 });
 
 test('preserves an upstream 413 response and makes exactly one attempt', { timeout: TEST_TIMEOUT }, async (t) => {

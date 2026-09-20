@@ -9,25 +9,34 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 export function buildSupervisor({ projectRoot = root } = {}) {
   if (process.platform !== 'win32') throw new Error('The Job supervisor requires Windows.');
   const source = join(projectRoot, 'native', 'JobHost.cs');
-  const destination = join(projectRoot, 'bin', 'JobHost.exe');
-  const stamp = `${destination}.sha256`;
-  const sourceHash = createHash('sha256').update(readFileSync(source)).digest('hex');
-  if (existsSync(destination) && existsSync(stamp) && readFileSync(stamp, 'utf8').trim() === sourceHash) return destination;
+  const sourceBytes = readFileSync(source);
+  const sourceHash = createHash('sha256').update(sourceBytes).digest('hex');
+  const destination = join(projectRoot, 'bin', `JobHost.${sourceHash}.exe`);
+  if (existsSync(destination)) return destination;
   const windows = process.env.SystemRoot || 'C:\\Windows';
   const compiler = [join(windows, 'Microsoft.NET', 'Framework64', 'v4.0.30319', 'csc.exe'), join(windows, 'Microsoft.NET', 'Framework', 'v4.0.30319', 'csc.exe')].find(existsSync);
   if (!compiler) throw new Error('The Windows .NET Framework C# compiler was not found.');
   mkdirSync(dirname(destination), { recursive: true });
   const temporary = `${destination}.${process.pid}.tmp.exe`;
+  const temporarySource = `${destination}.${process.pid}.tmp.cs`;
   try {
-    const result = spawnSync(compiler, ['/nologo', '/optimize+', '/target:exe', '/platform:anycpu', `/out:${temporary}`, source], { encoding: 'utf8', windowsHide: true, timeout: 30_000 });
+    writeFileSync(temporarySource, sourceBytes);
+    const result = spawnSync(compiler, ['/nologo', '/optimize+', '/target:exe', '/platform:anycpu', `/out:${temporary}`, temporarySource], { encoding: 'utf8', windowsHide: true, timeout: 30_000 });
     if (result.error || result.status !== 0) {
       throw new Error(`Could not build Windows Job supervisor. ${result.error?.message || result.stdout || result.stderr || `Compiler exit ${result.status}`}`);
     }
-    renameSync(temporary, destination);
-    writeFileSync(stamp, `${sourceHash}\n`, 'utf8');
+    if (existsSync(destination)) return destination;
+    try { renameSync(temporary, destination); }
+    catch (error) {
+      // The final name is published only after compilation. A concurrent builder
+      // may already be running this same source version; never replace its EXE.
+      if (existsSync(destination)) return destination;
+      throw error;
+    }
     return destination;
   } finally {
     if (existsSync(temporary)) unlinkSync(temporary);
+    if (existsSync(temporarySource)) unlinkSync(temporarySource);
   }
 }
 

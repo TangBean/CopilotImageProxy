@@ -445,8 +445,8 @@ export function createImageProcessor(config = {}) {
     stats.inputBytes += value.inputBytes;
     stats.outputBytes += value.outputBytes;
     if (value.transformed) {
-      part.image_url = value.dataUrl;
       stats.transformed += 1;
+      return value.dataUrl;
     } else {
       stats.retained += 1;
       stats.skipped[value.reason] += 1;
@@ -461,8 +461,13 @@ export function createImageProcessor(config = {}) {
       try {
         cancellation.throwIfAborted();
         const requestKeys = new Map();
-        await Promise.all(imageParts(payload).map((part) => processPart(part, stats, cancellation, requestKeys)));
+        const parts = imageParts(payload);
+        const replacements = await Promise.all(parts.map((part) => processPart(part, stats, cancellation, requestKeys)));
         cancellation.throwIfAborted();
+        // Commit only after every image succeeds; a cancelled request keeps its original payload.
+        for (let index = 0; index < parts.length; index += 1) {
+          if (replacements[index] !== undefined) parts[index].image_url = replacements[index];
+        }
         stats.cacheEntries = cache.size;
         stats.cacheAliases = wireCache.size;
         stats.cacheBytes = cacheBytes;

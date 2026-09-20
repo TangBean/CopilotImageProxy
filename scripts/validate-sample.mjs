@@ -1,6 +1,6 @@
-import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { writeFile, mkdir } from 'node:fs/promises';
+import { readImageSample } from './image-sample.mjs';
 import { dirname, resolve } from 'node:path';
-import { createHash } from 'node:crypto';
 import sharp from 'sharp';
 import { DEFAULT_CONFIG } from '../src/config.mjs';
 import { createImageProcessor } from '../src/images.mjs';
@@ -10,22 +10,7 @@ if (args.length < 2 || args.length > 3) {
   process.stderr.write('Usage: node scripts/validate-sample.mjs rollout.jsonl report.json [preview-directory]\n');
   process.exit(1);
 }
-const source = await readFile(args[0], 'utf8');
-const images = [];
-for (const line of source.split('\n')) {
-  if (!line.trim()) continue;
-  const row = JSON.parse(line);
-  if (row.type !== 'response_item') continue;
-  const item = row.payload;
-  const parts = item.type === 'message' ? item.content :
-    ['custom_tool_call_output', 'function_call_output'].includes(item.type) ? item.output : null;
-  if (!Array.isArray(parts)) continue;
-  for (const part of parts) {
-    if (part.type === 'input_image' && typeof part.image_url === 'string' && part.image_url.startsWith('data:image/')) {
-      images.push(structuredClone(part));
-    }
-  }
-}
+const { images, sha256 } = await readImageSample(args[0]);
 const payload = { input: [{ type: 'message', role: 'user', content: images }] };
 const processor = createImageProcessor(DEFAULT_CONFIG);
 const started = performance.now();
@@ -39,7 +24,7 @@ const outputBase64Bytes = base64Size(transformedImages);
 const againStarted = performance.now();
 const cached = await processor.transformPayload(structuredClone(payload));
 const report = {
-  generatedAt: new Date().toISOString(), sampleSha256: createHash('sha256').update(source).digest('hex'),
+  generatedAt: new Date().toISOString(), sampleSha256: sha256,
   imageCount: images.length, inputBase64Bytes, outputBase64Bytes,
   reductionPercent: (1 - outputBase64Bytes / inputBase64Bytes) * 100,
   elapsedMs, cachedElapsedMs: Math.round(performance.now() - againStarted),
@@ -49,8 +34,8 @@ const report = {
 if (args[2]) {
   const previewDir = resolve(args[2]);
   await mkdir(previewDir, { recursive: true });
-  // Contact sheet compares viewport, texture and final render; originals stay untouched.
-  const selected = [2, 5, images.length - 1].filter((n) => n >= 0 && n < images.length);
+  // Compare selected samples without changing the source images.
+  const selected = [...new Set([2, 5, images.length - 1])].filter((n) => n >= 0 && n < images.length);
   const tileWidth = 640; const tileHeight = 560; const composites = [];
   for (let row = 0; row < selected.length; row++) {
     const index = selected[row];
@@ -62,7 +47,7 @@ if (args[2]) {
   }
   await sharp({ create: { width: tileWidth * 2, height: tileHeight * selected.length, channels: 3, background: '#dddddd' } })
     .composite(composites).png().toFile(resolve(previewDir, 'before-after.png'));
-  report.preview = 'before-after.png: original on left; proxy output on right; rows are viewport, texture, render.';
+  report.preview = 'before-after.png: original on left; proxy output on right; rows follow the selected sample indices.';
 }
 await mkdir(dirname(resolve(args[1])), { recursive: true });
 await writeFile(args[1], JSON.stringify(report, null, 2) + '\n');

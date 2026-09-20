@@ -10,6 +10,7 @@ import { classifyCopilotArgs, resolveBinding, resolveLatestPackage } from './ups
 import { controlRequest, pipePath } from './control.mjs';
 import { VERSION } from './version.mjs';
 import { launchContextDigest } from './launch-context.mjs';
+import { createLogger } from './logging.mjs';
 
 const spec = JSON.parse(process.env.CIP_RUN_SPEC || 'null');
 const jobPipe = process.env.CIP_JOB_PIPE;
@@ -19,7 +20,7 @@ for (const name of ['CIP_RUN_SPEC', 'CIP_JOB_PIPE', 'CIP_JOB_TOKEN', 'CIP_JOB_HO
 if (!spec || !jobPipe || !token || !Number.isInteger(managerPid) || managerPid < 1) {
   process.stderr.write('The managed entry must be started by the native supervisor.\n'); process.exit(1);
 }
-const log = (entry) => process.stderr.write(JSON.stringify({ time: new Date().toISOString(), ...entry }) + '\n');
+let log = createLogger();
 const mode = classifyCopilotArgs(spec.argv);
 let server, appControl, child, lockHandle, statePath, lockPath, state;
 let stopping = false;
@@ -135,6 +136,7 @@ async function run() {
   let config;
   if (mode.managed) {
     config = loadConfig(spec.configPath, { allowMissing: !spec.explicitConfig, managedStart: true });
+    log = createLogger({ level: config.logLevel });
     await takeLock(resolve(spec.projectRoot, '.run'));
     const binding = resolveBinding(spec.argv, process.env);
     if (config.port === binding.port) throw new Error('Proxy and copilot-api cannot share the same port.');
@@ -147,7 +149,7 @@ async function run() {
     state = { version: VERSION, status: 'starting', runId: spec.runId, managerPid,
       managerStartTimeUtcTicks: String(manager.startTimeUtcTicks), proxyPid: process.pid,
       launcherPid: spec.launcherPid, copilotPid: null, copilotVersion: null,
-      managerPath: resolve(spec.projectRoot, 'bin/JobHost.exe'), entryPath: resolve(spec.projectRoot, 'src/index.mjs'),
+      managerPath: spec.managerPath, entryPath: resolve(spec.projectRoot, 'src/index.mjs'),
       configPath: spec.configPath, configSha256: createHash('sha256').update(configSource).digest('hex').toUpperCase(),
       argsDigest: createHash('sha256').update(JSON.stringify(spec.argv)).digest('hex'),
       startupContextDigest: launchContextDigest(spec.argv, spec.cwd, process.env), callerCwd: spec.cwd,
@@ -181,7 +183,7 @@ async function run() {
   server.on('error', () => shutdown(1));
   Object.assign(state, {status:'ready', copilotPid:child.pid, copilotVersion:packageInfo.version, upstream});
   await saveState();
-  log({ event: 'ready', version: VERSION, proxyPort: config.port, upstreamPort: binding.port,
+  log({ event: 'ready', version: VERSION, logLevel: config.logLevel, proxyPort: config.port, upstreamPort: binding.port,
     managerPid, proxyPid: process.pid, copilotVersion: packageInfo.version });
   const code = await exitPromise;
   if (!stopping) { log({ event: 'upstream_exited', code }); await shutdown(code || 1); }

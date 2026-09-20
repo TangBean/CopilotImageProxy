@@ -76,4 +76,4 @@ HTTP 主线程先做保守的字节标记检查。无 `input_image` 且无 `\u` 
 
 停止服务时不再接收新工作，并取消或关闭剩余请求与处理任务；最后由受管进程退出和 Job 回收保证整套服务结束。该机制不改变 Codex 自身的重试逻辑。
 
-首次启动会使用 Windows .NET Framework 编译器构建 `bin/JobHost.exe`；源码变化后重建，构建产物不提交。也可执行 `npm run build:supervisor`。进程回收、CLI 兼容性和 worker 性能的实测记录见 [v2 验收记录](validation-v2.md)；文档里的默认值与设计行为不替代真实上游验收。
+首次启动会使用 Windows .NET Framework 编译器构建 `bin/JobHost.<源码 SHA-256>.exe`。构建使用对应源码快照，完成后才发布；并发启动复用同一版本，源码变化产生新文件，不覆盖仍在运行的旧版本。状态文件记录实际可执行路径，停止脚本同时兼容旧版 `bin/JobHost.exe`。构建产物不提交。也可执行 `npm run build:supervisor`。进程回收、CLI 兼容性和 worker 性能的实测记录见 [v2 验收记录](validation-v2.md)；文档里的默认值与设计行为不替代真实上游验收。

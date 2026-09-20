@@ -42,7 +42,7 @@ async function run() {
   const helper = buildSupervisor();
   const jobPipe = `copilot-image-proxy-${randomUUID()}`;
   const token = randomBytes(32).toString('hex');
-  const spec = { ...invocation, projectRoot: root, launcherPid: process.pid, runId: randomUUID() };
+  const spec = { ...invocation, projectRoot: root, managerPath: helper, launcherPid: process.pid, runId: randomUUID() };
   const child = spawn(helper, ['--parent-pid', String(process.pid), '--node', process.execPath,
     '--entry', resolve(root, 'src/managed.mjs')], {
     cwd: invocation.cwd, stdio: 'inherit', windowsHide: false, shell: false,

@@ -1,4 +1,5 @@
-import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { writeFile, mkdir } from 'node:fs/promises';
+import { readImageSample } from './image-sample.mjs';
 import { dirname, resolve } from 'node:path';
 
 const [rollout, reportPath, baseUrl = 'http://127.0.0.1:4142'] = process.argv.slice(2);
@@ -6,19 +7,7 @@ if (!rollout || !reportPath) {
   process.stderr.write('Usage: node scripts/validate-live.mjs rollout.jsonl report.json [proxy-url]\n');
   process.exit(1);
 }
-const images = [];
-for (const line of (await readFile(rollout, 'utf8')).split('\n')) {
-  if (!line.trim()) continue;
-  const row = JSON.parse(line);
-  if (row.type !== 'response_item') continue;
-  const item = row.payload;
-  const parts = item.type === 'message' ? item.content :
-    ['custom_tool_call_output', 'function_call_output'].includes(item.type) ? item.output : null;
-  if (!Array.isArray(parts)) continue;
-  for (const part of parts) {
-    if (part.type === 'input_image' && typeof part.image_url === 'string' && part.image_url.startsWith('data:image/')) images.push(part);
-  }
-}
+const { images } = await readImageSample(rollout, 2);
 const report = { startedAt: new Date().toISOString(), model: 'gpt-6-astra', imageCount: images.length, checks: [] };
 async function save() {
   await mkdir(dirname(resolve(reportPath)), { recursive: true });
@@ -69,8 +58,8 @@ async function check(name, input, expectedImageCount) {
 try {
   await check('plain_text', [{ role: 'user', content: [{ type: 'input_text', text: 'Reply exactly PROXY_TEXT_OK.' }] }], 0);
   const history = [{ type: 'message', role: 'user', content: [
-    { type: 'input_text', text: 'These are 18 reference images, texture previews and renders from one Blender task. In three short bullets identify the building roof material, one texture pattern, and the visible material/color of the building walls. Base this only on the images.' }, ...images] }];
-  history.push(await check('eighteen_images', history, images.length));
+    { type: 'input_text', text: `These are ${images.length} reference images, texture previews and renders from one Blender task. In three short bullets identify the building roof material, one texture pattern, and the visible material/color of the building walls. Base this only on the images.` }, ...images] }];
+  history.push(await check('sample_images', history, images.length));
   for (let turn = 1; turn <= 2; turn++) {
     history.push({ type: 'message', role: 'user', content: [
       { type: 'input_text', text: `Continuation ${turn}: here is another preview from the same task. Describe one clearly visible geometric or material detail in this last image in one sentence.` },

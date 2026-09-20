@@ -78,12 +78,21 @@ export function createProxyServer({ config: overrides = {}, log = () => {}, mana
     let logged = false;
     const finishLog = () => {
       if (logged) return; logged = true;
-      safeLog({ event: 'request', ...metrics, status: res.statusCode,
+      safeLog({ event: 'request', ...metrics, status: res.headersSent ? res.statusCode : null,
         aborted: signal.aborted, durationMs: Math.round(performance.now() - started) });
     };
     const abort = () => {
-      if (!signal.aborted) controller.abort(new DOMException('Client disconnected', 'AbortError'));
+      metrics.abortSource ||= 'client';
+      if (!signal.aborted) controller.abort(new DOMException('Request disconnected', 'AbortError'));
       upstreamRequest?.destroy(); upstreamResponse?.destroy();
+    };
+    const upstreamStreamFailed = (code) => {
+      // Destroying the upstream after a client disconnect also emits aborted/error.
+      // Record the first observed cause, not the cleanup events that follow it.
+      if (signal.aborted || res.destroyed) return;
+      metrics.abortSource ||= 'upstream';
+      metrics.error ||= code;
+      res.destroy();
     };
     req.once('aborted', abort);
     res.once('close', () => { if (!res.writableFinished) abort(); finishLog(); });
@@ -150,7 +159,7 @@ export function createProxyServer({ config: overrides = {}, log = () => {}, mana
         clearConnectTimer();
         if (signal.aborted || res.destroyed) return;
         metrics.error ||= 'proxy_upstream_unavailable';
-        if (res.headersSent) res.destroy();
+        if (res.headersSent) { metrics.abortSource ||= 'upstream'; res.destroy(); }
         else {
           res.writeHead(502, { 'content-type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify({ error: { code: metrics.error, message: '无法连接或读取原 copilot-api，请检查其运行状态。' } }));
@@ -161,8 +170,8 @@ export function createProxyServer({ config: overrides = {}, log = () => {}, mana
         if (signal.aborted) { incoming.destroy(); return; }
         res.writeHead(incoming.statusCode, headersWithoutHopByHop(incoming.headers));
         res.flushHeaders();
-        incoming.once('error', () => { metrics.error = 'proxy_upstream_stream_error'; res.destroy(); });
-        incoming.once('aborted', () => { metrics.error = 'proxy_upstream_stream_aborted'; res.destroy(); });
+        incoming.once('error', () => upstreamStreamFailed('proxy_upstream_stream_error'));
+        incoming.once('aborted', () => upstreamStreamFailed('proxy_upstream_stream_aborted'));
         incoming.pipe(res);
       });
       if (body) upstreamRequest.end(body);
@@ -176,7 +185,7 @@ export function createProxyServer({ config: overrides = {}, log = () => {}, mana
         ? new ProxyError(error.status, error.code, error.message, error.details)
         : new ProxyError(500, 'proxy_internal_error', '图片代理内部处理失败，请查看元数据日志。');
       metrics.error = local.code;
-      if (res.headersSent) { res.destroy(); return; }
+      if (res.headersSent) { metrics.abortSource ||= 'proxy'; res.destroy(); return; }
       res.writeHead(local.status, { 'content-type': 'application/json; charset=utf-8', 'connection': 'close' });
       res.end(JSON.stringify({ error: { code: local.code, message: local.message, ...local.details } }));
     }
