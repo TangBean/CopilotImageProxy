@@ -8,6 +8,7 @@ export const DEFAULT_CONFIG = Object.freeze({
   upstreamStartupTimeoutMs: 180000,
   maxImageQueueMiB: 256,
   logLevel: 'info',
+  sessionIndexPath: null,
   plaintextCollaborationModels: Object.freeze([]),
   earlyResponseErrorModels: Object.freeze([]),
 });
@@ -30,6 +31,10 @@ export function validateConfig(overrides = {}, { managedUpstream = false, skipUp
     config[key] = Object.freeze([...new Set(config[key])]);
   }
   if (!LOG_LEVELS.includes(config.logLevel)) throw new Error(`logLevel must be one of: ${LOG_LEVELS.join(', ')}.`);
+  if (config.sessionIndexPath !== null &&
+      (typeof config.sessionIndexPath !== 'string' || !config.sessionIndexPath.trim())) {
+    throw new Error('sessionIndexPath must be null or a non-empty path string.');
+  }
   if (!['127.0.0.1', 'localhost', '::1'].includes(config.host)) throw new Error('host must be a loopback address.');
   const integer = (key, min, max) => {
     if (!Number.isInteger(config[key]) || config[key] < min || config[key] > max) {

@@ -12,6 +12,7 @@
   "upstreamStartupTimeoutMs": 180000,
   "maxImageQueueMiB": 256,
   "logLevel": "info",
+  "sessionIndexPath": null,
   "plaintextCollaborationModels": [],
   "earlyResponseErrorModels": []
 }

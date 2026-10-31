@@ -8,6 +8,8 @@ import { validateConfig } from './config.mjs';
 import { VERSION } from './version.mjs';
 import { createPlaintextCollaboration, CollaborationError } from './collaboration-plaintext.mjs';
 import { adaptSse, preflightSse, readJsonResponse, writeStream, ResponseStreamError, MAX_JSON_RESPONSE_BYTES } from './responses-stream.mjs';
+import { createSessionTitleReader } from './session-titles.mjs';
+import { rewriteUsageViewer } from './usage-viewer.mjs';
 
 const decompressors = { zstd: promisify(zstdDecompress), gzip: promisify(gunzip), deflate: promisify(inflate) };
 const transformedRoutes = new Set(['/responses', '/responses/compact', '/v1/responses', '/v1/responses/compact']);
@@ -66,6 +68,7 @@ async function decodeBody(raw, encoding, limit) {
 
 export function createProxyServer({ config: overrides = {}, log = () => {}, managedUpstream = false, useWorker = true } = {}) {
   const config = validateConfig(overrides, { managedUpstream });
+  const readSessionTitles = createSessionTitleReader(config.sessionIndexPath);
   const upstreamBase = new URL(config.upstream);
   const transformer = createBodyTransformer({ config, useWorker });
   const agents = { 'http:': new http.Agent({ keepAlive: true }), 'https:': new https.Agent({ keepAlive: true }) };
@@ -79,6 +82,7 @@ export function createProxyServer({ config: overrides = {}, log = () => {}, mana
     let upstreamRequest; let upstreamResponse;
     let collaboration;
     let inspectEarlyError = false;
+    let usageViewer = false;
     let responseHandled = false;
     const metrics = { requestId, method: req.method, upstreamRequests: 0 };
     let logged = false;
@@ -124,6 +128,21 @@ export function createProxyServer({ config: overrides = {}, log = () => {}, mana
       const headers = headersWithoutHopByHop(incoming.headers);
       const success = incoming.statusCode >= 200 && incoming.statusCode < 300;
       const type = String(incoming.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+      const encoding = String(incoming.headers['content-encoding'] || '').trim().toLowerCase();
+      if (usageViewer && incoming.statusCode === 200 && type === 'text/html' && (!encoding || encoding === 'identity')) {
+        const chunks = [];
+        for await (const chunk of incoming) chunks.push(chunk);
+        signal.throwIfAborted();
+        const original = Buffer.concat(chunks);
+        const rewritten = rewriteUsageViewer(original, config);
+        if (rewritten) {
+          for (const name of ['content-length', 'content-encoding', 'content-md5', 'digest', 'content-digest', 'repr-digest', 'etag', 'last-modified']) delete headers[name];
+          headers['content-length'] = String(rewritten.length);
+        }
+        responseHandled = true;
+        res.writeHead(incoming.statusCode, headers); res.end(rewritten ?? original);
+        return;
+      }
       const sse = type === 'text/event-stream';
       const needsRead = success && (collaboration || (inspectEarlyError && sse));
       if (!needsRead) {
@@ -133,7 +152,6 @@ export function createProxyServer({ config: overrides = {}, log = () => {}, mana
         incoming.pipe(res);
         return;
       }
-      const encoding = String(incoming.headers['content-encoding'] || '').trim().toLowerCase();
       if (encoding && encoding !== 'identity') throw new ResponseStreamError('proxy_response_encoding', '上游未遵守 identity 响应编码要求。');
       if (collaboration) {
         for (const name of ['content-length', 'content-encoding', 'content-md5', 'digest', 'etag']) delete headers[name];
@@ -190,9 +208,18 @@ export function createProxyServer({ config: overrides = {}, log = () => {}, mana
         res.end(JSON.stringify({ service: 'copilot-image-proxy', status: 'ok', pid: process.pid, version: VERSION }));
         return;
       }
+      if (req.method === 'GET' && route === '/__session-titles') {
+        const titles = await readSessionTitles();
+        if (signal.aborted) return;
+        res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+        res.end(JSON.stringify(titles));
+        return;
+      }
+      usageViewer = req.method === 'GET' && route === '/usage-viewer';
       let body;
       const headers = headersWithoutHopByHop(req.headers);
       delete headers.host;
+      if (usageViewer) headers['accept-encoding'] = 'identity';
       if (req.method === 'POST' && transformedRoutes.has(route)) {
         const inputLimit = Math.floor(config.maxInputMiB * 1048576);
         const raw = await readBody(req, inputLimit, signal);

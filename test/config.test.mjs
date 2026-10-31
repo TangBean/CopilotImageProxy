@@ -41,3 +41,14 @@ test('managed startup validates the derived upstream instead of an ignored confi
   assert.equal(effective.upstream,'http://127.0.0.1:4143');
   assert.throws(()=>validateConfig({...initial,upstream:'http://127.0.0.1:4141'},{managedUpstream:true}));
 });
+
+test('session index configuration allows the default or an explicit path without requiring a file', () => {
+  assert.equal(validateConfig().sessionIndexPath, null);
+  const path = join(tmpdir(), 'copilot-image-proxy-missing-index', 'session_index.jsonl');
+  assert.equal(validateConfig({ sessionIndexPath: path }).sessionIndexPath, path);
+  assert.equal(validateConfig({ sessionIndexPath: './session_index.jsonl' }).sessionIndexPath, './session_index.jsonl');
+  for (const sessionIndexPath of ['', ' \t\n', 0, false, [], {}, undefined]) {
+    assert.throws(() => validateConfig({ sessionIndexPath }), /sessionIndexPath/);
+    assert.throws(() => validateConfig({ sessionIndexPath }, { skipUpstream: true }), /sessionIndexPath/);
+  }
+});

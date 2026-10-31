@@ -1,8 +1,11 @@
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { once } from 'node:events';
+import { mkdtemp, mkdir, writeFile, utimes, unlink, rmdir, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { zstdCompressSync } from 'node:zlib';
+import { gzipSync, zstdCompressSync } from 'node:zlib';
 import test from 'node:test';
 import sharp from 'sharp';
 import { DEFAULT_CONFIG } from '../src/config.mjs';
@@ -570,4 +573,204 @@ test('isolates concurrent requests while keeping one upstream attempt per reques
   assert.ok(results.every((result) => result.status === 200));
   assert.equal(env.requests.length, 4);
   assert.deepEqual(env.requests.map((entry) => JSON.parse(entry.body).metadata.index).sort(), [0, 1, 2, 3]);
+});
+
+async function sessionIndexFixture(t, contents) {
+  const directory = await mkdtemp(join(tmpdir(), 'copilot-proxy-session-titles-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const path = join(directory, 'session_index.jsonl');
+  if (contents !== undefined) await writeFile(path, contents);
+  return path;
+}
+
+test('session titles use the latest timestamp and skip corrupt records without reaching upstream', { timeout: TEST_TIMEOUT }, async (t) => {
+  const rows = [
+    { id: 'thread-1', thread_name: '最新中文标题', updated_at: '2026-10-31T10:00:00Z' },
+    { id: 'thread-1', thread_name: 'older last line', updated_at: '2026-10-30T10:00:00Z' },
+    { id: 'thread-2', thread_name: 'preserve whitespace ', updated_at: '2026-10-31T10:00:00Z' },
+    { id: 'cleared', thread_name: 'old title', updated_at: '2026-10-30T10:00:00Z' },
+    { id: 'cleared', thread_name: ' \t ', updated_at: '2026-10-31T10:00:00Z' },
+    { id: 'invalid-date', thread_name: 'ignored', updated_at: 'invalid' },
+    { id: '__proto__', thread_name: 'ordinary ID', updated_at: '2026-10-31T10:00:00Z' },
+    null,
+  ];
+  const sessionIndexPath = await sessionIndexFixture(t, rows.map((row) => JSON.stringify(row)).join('\n') + '\n{broken\n');
+  const env = await setup(t, { config: { sessionIndexPath } });
+  const result = await send(env.url, { method: 'GET', path: '/__session-titles?refresh=1' });
+  assert.equal(result.status, 200);
+  assert.match(result.headers['content-type'], /^application\/json/);
+  assert.equal(result.headers['cache-control'], 'no-store');
+  assert.deepEqual(JSON.parse(result.body), {
+    'thread-1': '最新中文标题', 'thread-2': 'preserve whitespace ', ['__proto__']: 'ordinary ID',
+  });
+  assert.equal(env.requests.length, 0);
+});
+
+test('session title cache refreshes on mtime or size changes', { timeout: TEST_TIMEOUT }, async (t) => {
+  const contents = (title) => JSON.stringify({ id: 'thread', thread_name: title, updated_at: '2026-10-31T10:00:00Z' });
+  const sessionIndexPath = await sessionIndexFixture(t, contents('before'));
+  const firstTime = new Date('2026-10-31T10:00:00Z');
+  const nextTime = new Date('2026-10-31T10:01:00Z');
+  await utimes(sessionIndexPath, firstTime, firstTime);
+  const env = await setup(t, { config: { sessionIndexPath } });
+  const read = async () => JSON.parse((await send(env.url, { method: 'GET', path: '/__session-titles' })).body);
+  assert.deepEqual(await read(), { thread: 'before' });
+  await writeFile(sessionIndexPath, contents('after!'));
+  await utimes(sessionIndexPath, firstTime, firstTime);
+  assert.deepEqual(await read(), { thread: 'before' }, 'same mtime and size must use the cached mapping');
+  await utimes(sessionIndexPath, nextTime, nextTime);
+  assert.deepEqual(await read(), { thread: 'after!' });
+  await writeFile(sessionIndexPath, contents('longer title'));
+  await utimes(sessionIndexPath, nextTime, nextTime);
+  assert.deepEqual(await read(), { thread: 'longer title' });
+  assert.equal(env.requests.length, 0);
+});
+
+test('missing or unreadable session indexes return empty mappings and recover without affecting other routes', { timeout: TEST_TIMEOUT }, async (t) => {
+  const sessionIndexPath = await sessionIndexFixture(t);
+  const env = await setup(t, { config: { sessionIndexPath } });
+  const read = async () => {
+    const result = await send(env.url, { method: 'GET', path: '/__session-titles' });
+    assert.equal(result.status, 200);
+    return JSON.parse(result.body);
+  };
+  assert.deepEqual(await read(), {});
+  await mkdir(sessionIndexPath);
+  assert.deepEqual(await read(), {});
+  await rmdir(sessionIndexPath);
+  await writeFile(sessionIndexPath, JSON.stringify({ id: 'thread', thread_name: 'recovered', updated_at: '2026-10-31T10:00:00Z' }));
+  assert.deepEqual(await read(), { thread: 'recovered' });
+  await unlink(sessionIndexPath);
+  assert.deepEqual(await read(), {});
+  assert.equal(env.requests.length, 0);
+  const ordinary = await send(env.url, { method: 'GET', path: '/token-usage/sessions?period=week' });
+  assert.deepEqual(JSON.parse(ordinary.body), { ok: true });
+  assert.equal(env.requests.length, 1);
+});
+
+const usageViewerHtml = '<!doctype html><html><body><p>会话统计</p><script>const DEFAULT_ENDPOINT = "http://localhost:4141/usage";</script></body></html>';
+const viewerValidators = {
+  etag: '"upstream-html"', 'content-md5': 'upstream-md5', digest: 'sha-256=upstream-digest',
+  'content-digest': 'sha-256=:upstream-digest:', 'repr-digest': 'sha-256=:upstream-digest:',
+  'last-modified': 'Sat, 31 Oct 2026 10:00:00 GMT',
+};
+
+test('usage viewer preserves non-UTF-8 bytes outside its ASCII edits', { timeout: TEST_TIMEOUT }, async (t) => {
+  const bytes = Buffer.from(usageViewerHtml.replace('会话统计', 'caf\u00e9'), 'latin1');
+  const env = await setup(t, { config: { port: 18042 }, handle: (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html; charset=iso-8859-1', 'content-length': String(bytes.length) });
+    res.end(bytes);
+  } });
+  const result = await send(env.url, { method: 'GET', path: '/usage-viewer' });
+  assert.equal(result.status, 200);
+  assert.equal(result.headers['content-type'], 'text/html; charset=iso-8859-1');
+  assert.ok(result.body.includes(Buffer.from('caf\u00e9', 'latin1')));
+  assert.ok(result.body.includes('http://127.0.0.1:18042/usage'));
+  assert.ok(result.body.includes('MutationObserver'));
+  assert.equal(Number(result.headers['content-length']), result.body.length);
+  const restored = Buffer.from(result.body.toString('latin1')
+    .replace(/<script>\nfetch\('\/__session-titles'\)[\s\S]*?<\/script>/, '')
+    .replace('http://127.0.0.1:18042/usage', 'http://localhost:4141/usage'), 'latin1');
+  assert.deepEqual(restored, bytes);
+});
+
+test('usage viewer rewrites the configured origin and injects a static script with correct headers', { timeout: TEST_TIMEOUT }, async (t) => {
+  const bytes = Buffer.from(usageViewerHtml);
+  const sessionIndexPath = await sessionIndexFixture(t, JSON.stringify({ id: 'thread', thread_name: 'TITLE_MUST_NOT_BE_EMBEDDED', updated_at: '2026-10-31T10:00:00Z' }));
+  for (const host of ['127.0.0.1', '::1']) {
+    const env = await setup(t, { config: { sessionIndexPath, host, port: 18042 }, handle: (_req, res) => {
+      res.writeHead(200, {
+        'content-type': 'text/html; charset=UTF-8', 'content-encoding': 'identity',
+        'content-length': String(bytes.length), ...viewerValidators, 'x-upstream-marker': 'kept',
+      });
+      res.write(bytes.subarray(0, 70)); res.end(bytes.subarray(70));
+    } });
+    const path = '/usage-viewer?endpoint=http%3A%2F%2Fexample.invalid%2Fusage';
+    const result = await send(env.url, { method: 'GET', path, headers: { host: 'untrusted.invalid:9999', 'accept-encoding': 'gzip, deflate' } });
+    const html = result.body.toString();
+    const originHost = host === '::1' ? '[::1]' : host;
+    assert.equal(result.status, 200);
+    assert.ok(html.includes(`const DEFAULT_ENDPOINT = "http://${originHost}:18042/usage";`));
+    assert.ok(!html.includes('http://localhost:4141/usage'));
+    assert.ok(!html.includes('TITLE_MUST_NOT_BE_EMBEDDED'));
+    assert.match(html, /fetch\(['"]\/__session-titles['"]\)/);
+    assert.match(html, /MutationObserver/);
+    assert.ok(html.indexOf('MutationObserver') < html.lastIndexOf('</body>'));
+    assert.equal(Number(result.headers['content-length']), result.body.length);
+    assert.notEqual(result.body.length, html.length, 'UTF-8 length must count bytes');
+    assert.equal(result.headers['content-type'], 'text/html; charset=UTF-8');
+    assert.equal(result.headers['x-upstream-marker'], 'kept');
+    for (const header of Object.keys(viewerValidators)) assert.equal(result.headers[header], undefined, header);
+    assert.equal(env.requests[0].url, path);
+    assert.equal(env.requests[0].headers['accept-encoding'], 'identity');
+  }
+});
+
+test('usage viewer passes unsupported responses through with original status, headers, and bytes', { timeout: TEST_TIMEOUT }, async (t) => {
+  const invalidUtf8 = Buffer.from([0xff, 0x80]);
+  const cases = [
+    { name: 'non-html', type: 'text/plain', body: Buffer.from(usageViewerHtml) },
+    { name: 'non-200', status: 503, body: Buffer.from(usageViewerHtml) },
+    { name: 'compressed', encoding: 'gzip', body: gzipSync(usageViewerHtml) },
+    { name: 'missing-endpoint', body: Buffer.concat([invalidUtf8, Buffer.from('<html><body>unchanged</body></html>')]) },
+    { name: 'missing-body', body: Buffer.concat([invalidUtf8, Buffer.from(usageViewerHtml.replace('</body>', ''))]) },
+    { name: 'missing-content-type', type: null, body: Buffer.from(usageViewerHtml) },
+  ];
+  const env = await setup(t, { handle: (req, res) => {
+    const fixture = cases.find((item) => req.url.endsWith(item.name));
+    const headers = { 'content-length': String(fixture.body.length), ...viewerValidators, 'x-upstream-marker': fixture.name };
+    if (fixture.type !== null) headers['content-type'] = fixture.type ?? 'text/html; charset=UTF-8';
+    if (fixture.encoding) headers['content-encoding'] = fixture.encoding;
+    res.writeHead(fixture.status ?? 200, headers); res.end(fixture.body);
+  } });
+  for (const fixture of cases) {
+    const result = await send(env.url, { method: 'GET', path: `/usage-viewer?case=${fixture.name}`, headers: { 'accept-encoding': 'gzip' } });
+    assert.equal(result.status, fixture.status ?? 200, fixture.name);
+    assert.deepEqual(result.body, fixture.body, fixture.name);
+    assert.equal(Number(result.headers['content-length']), fixture.body.length);
+    assert.equal(result.headers['content-type'], fixture.type === null ? undefined : fixture.type ?? 'text/html; charset=UTF-8');
+    assert.equal(result.headers['content-encoding'], fixture.encoding);
+    assert.equal(result.headers['x-upstream-marker'], fixture.name);
+    for (const [header, value] of Object.entries(viewerValidators)) assert.equal(result.headers[header], value, `${fixture.name}: ${header}`);
+    assert.equal(env.requests.at(-1).headers['accept-encoding'], 'identity');
+  }
+});
+
+test('usage viewer returns 502 when an eligible HTML response ends prematurely', { timeout: TEST_TIMEOUT }, async (t) => {
+  const bytes = Buffer.from(usageViewerHtml);
+  const env = await setup(t, { handle: async (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html', 'content-length': String(bytes.length) });
+    res.write(bytes.subarray(0, 60));
+    await delay(30);
+    res.destroy();
+  } });
+  const result = await send(env.url, { method: 'GET', path: '/usage-viewer' });
+  assert.equal(result.status, 502);
+  assert.equal(JSON.parse(result.body).error.code, 'proxy_upstream_stream_error');
+  assert.equal((await send(env.url, { method: 'GET', path: '/healthz' })).status, 200);
+});
+
+test('viewer and title additions do not intercept other methods or routes', { timeout: TEST_TIMEOUT }, async (t) => {
+  const bytes = Buffer.from(usageViewerHtml);
+  const env = await setup(t, { handle: (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html', 'content-length': String(bytes.length), ...viewerValidators });
+    res.end(bytes);
+  } });
+  const cases = [
+    ['GET', '/usage-viewer/'], ['GET', '/v1/usage-viewer'], ['GET', '/token-usage/sessions?period=week'],
+    ['GET', '/__session-titles-extra'], ['POST', '/usage-viewer'], ['POST', '/__session-titles'],
+    ['HEAD', '/usage-viewer'], ['HEAD', '/__session-titles'],
+  ];
+  for (const [method, path] of cases) {
+    const body = method === 'POST' ? 'opaque non-JSON bytes' : '';
+    const result = await send(env.url, { method, path, body, headers: { 'accept-encoding': 'gzip' } });
+    assert.equal(result.status, 200);
+    assert.deepEqual(result.body, method === 'HEAD' ? Buffer.alloc(0) : bytes, `${method} ${path}`);
+    assert.equal(Number(result.headers['content-length']), bytes.length);
+    for (const [header, value] of Object.entries(viewerValidators)) assert.equal(result.headers[header], value);
+    assert.equal(env.requests.at(-1).method, method);
+    assert.equal(env.requests.at(-1).url, path);
+    assert.equal(env.requests.at(-1).body.toString(), body);
+    assert.equal(env.requests.at(-1).headers['accept-encoding'], 'gzip');
+  }
 });
