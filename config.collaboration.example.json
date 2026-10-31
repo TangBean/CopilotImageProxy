@@ -1,0 +1,4 @@
+{
+  "plaintextCollaborationModels": ["gpt-6-astra", "gpt-6.1-sol"],
+  "earlyResponseErrorModels": ["gpt-6-astra", "gpt-6.1-sol"]
+}

@@ -87,7 +87,9 @@ Invoke-RestMethod 'http://127.0.0.1:4142/healthz'
   "connectTimeoutMs": 10000,
   "upstreamStartupTimeoutMs": 180000,
   "maxImageQueueMiB": 256,
-  "logLevel": "info"
+  "logLevel": "info",
+  "plaintextCollaborationModels": [],
+  "earlyResponseErrorModels": []
 }
 ```
 
@@ -104,6 +106,8 @@ Invoke-RestMethod 'http://127.0.0.1:4142/healthz'
 | `upstreamStartupTimeoutMs` | 等待 copilot-api 就绪的时限，默认 180 秒。 |
 | `maxImageQueueMiB` | 图片候选请求的 worker 队列容量预算，默认 256 MiB；满时本地返回 503，不发送上游。 |
 | `logLevel` | 代理日志最低级别，默认 `info`；支持 `debug`、`info`、`warn`、`error`、`silent`，修改后手动重启生效。 |
+| `plaintextCollaborationModels` | 为列表内模型启用 Codex v2 明文协作适配，默认 `[]`。首版仅接受 `gpt-6-astra`、`gpt-6.1-sol`，精确匹配入站 `model`。 |
+| `earlyResponseErrorModels` | 为列表内模型启用初始 SSE 错误检查，默认 `[]`；支持相同两个模型，与明文适配独立。 |
 
 **24 MiB 是本项目选择的预算，不是 GitHub 公布的请求限制。** 超限时返回 `413 / proxy_payload_budget_exceeded` 和字节统计，且上游请求次数为零。代理不删图，不继续降低画质。可以提前整理上下文，或显式调整画质和预算。
 
@@ -112,11 +116,21 @@ Invoke-RestMethod 'http://127.0.0.1:4142/healthz'
 - 处理 `POST /responses`、`/responses/compact` 及带 `/v1` 前缀的对应路由。图片位置包括消息 `content[]`、`function_call_output.output[]` 和 `custom_tool_call_output.output[]`。历史里仍携带的旧图也会处理。
 - 不透明静态图转换为 JPEG；真正透明的图保留 PNG；处理方向与色彩空间。动画、多帧、无法处理的图保留原内容。已满足要求且重编码无收益的图保留原数据。
 - 保留图片顺序、文字、工具调用 ID 和其他字段。不下载 HTTP 图片 URL，也不改写 `file_id`。
-- 无图片标记且无 Unicode 转义的请求直接通过，不做 JSON 解析；存在 `input_image` 或 `\u` 候选时回退解析，防止转义图片类型漏过。无图路径仍检查字节预算；无图的畸形 JSON 交给上游验证。
+- 两项协作兼容配置均为空时，无图片标记且无 Unicode 转义的请求直接通过，不做 JSON 解析；存在 `input_image` 或 `\u` 候选时回退解析，防止转义图片类型漏过。配置了兼容模型列表时，普通 Responses 请求另行解析以匹配模型与工具合同。无图路径仍检查字节预算；无图的畸形 JSON 交给上游验证。
 - 图片候选请求的 JSON 与图片处理使用按需创建的单例 worker，避免这些同步计算占用 HTTP 主线程。队列有独立容量上限；worker 的性能实测以验收记录为准。
 - 两级内存缓存分别识别相同 data URL 和相同解码内容，保存最终输出 URL，重复历史图命中时避免再次解码或有损编码。缓存不把原图写到磁盘，缓存容量不等于整个服务的 RSS。
 - 支持解压 zstd、gzip 和 deflate 入站请求，向上游发送普通 JSON 并更新长度、编码相关 headers。其他路由按字节流透传。
-- SSE 及时逐块转发；客户端取消会取消对应上游请求。上游 HTTP 错误透传，每个入站请求最多发出一次上游请求。Codex 自身的重试仍可能产生新的入站请求。
+- 默认 SSE 逐块转发；启用协作兼容时按预算预检或按事件改写，写入仍遵守背压。客户端取消会取消对应上游请求。上游 HTTP 错误透传，每个入站请求最多发出一次上游请求。Codex 自身的重试仍可能产生新的入站请求。
+
+## Codex v2 明文协作兼容
+
+这是针对 Copilot 原生协作工具兼容问题的绕过，不是对上游加密算法或密钥的修复。明文表示仅涉及 Responses JSON 中的任务文本；远程连接仍沿用原有传输方式。默认关闭，只处理普通 HTTP Responses 路由，不改变 compact 路由，不恢复、省略或迁移未知旧密文。
+
+明文适配将原生 `collaboration` 工具改为普通别名 `codex_collaboration_plaintext`，仅去掉三个消息工具的 `message.encrypted`。返回时恢复原 namespace 并补 `encrypted_function_args: []`，由 Codex 自身构造明文消息。任务正文、调用 ID、模型、思考强度和 v2 调度保持不变。激活后要求 `store=false` 和显式历史回放，不支持 `previous_response_id` / `conversation` 隐式续接。身份、别名或加密元数据冲突明确失败。
+
+早期错误检查独立开启，预算为 2 秒、16 个事件或 256 KiB 初始缓冲阈值；空失败后最多再等 250ms，仍受总期限限制。只将带明确非法请求代码和非空诊断的错误转为 HTTP 400。其他错误按原流行为处理，不猜测、不重试。改写路径单事件上限 8 MiB、非流式 JSON 上限 32 MiB。
+
+[默认配置示例](config.example.json) 保持关闭；[候选配置示例](config.collaboration.example.json) 同时启用两个目标模型。完整合同、错误分类、旧密文限制、手动切换和回退步骤见 [协作兼容说明](docs/collaboration-compatibility.md)。代理结构化日志不记录任务正文、参数、密文或哈希。
 
 代理自身日志只写请求类型、字节数、处理计数、耗时和状态等元数据。默认 `logLevel: "info"` 只输出启动、停止和简短异常：正常请求、健康检查、客户端断开以及完整图片/缓存统计只在 `debug` 级别显示。HTTP 4xx 使用 `warn`，HTTP 5xx、上游流异常和内部错误使用 `error`。`warn` / `error` 可进一步减少日志，`silent` 关闭代理自己的结构化日志。
 
@@ -134,6 +148,8 @@ Invoke-RestMethod 'http://127.0.0.1:4142/healthz'
 
 ## 从 v1 迁移、接入与验证
 
+本节的 v1 / v2 指图片代理产品版本；Codex 多代理协议的切换见上面的协作兼容说明。
+
 第一次切换到 v2 时，先使用旧版停止方式关闭 v1 的 4142，再停止原先独立运行的 4141。确认两个端口释放后启动 v2；v2 不会自动接管旧进程。之后启动或停止 v2 就同时管理两者。
 
 Codex provider 的 `base_url` 指向图片代理，例如 `http://127.0.0.1:4142`；原地址带 `/v1` 时保留该后缀。模型、认证和 compact 配置不需要由本项目改写。启动器不会自动修改 Codex 配置。
@@ -146,6 +162,8 @@ npm test
 ```
 
 构建产物位于 `bin/`，不纳入源码提交。问题背景见 [研究记录](docs/research.md)；[v1 验收记录](docs/validation.md) 只代表旧版本结果。v2 的 CLI、生命周期与 worker 性能结果统一记录在 [v2 验收记录](docs/validation-v2.md)，不能把旧版测试数字当作新版结论。
+
+[10 月 3 日](docs/session-replay-20261003.md) 与 [10 月 4 日](docs/session-replay-20261004.md) 的 session replay 调查记录保留为历史资料，其中的旧省略方案不代表当前实现。
 
 ## 验收脚本输入
 

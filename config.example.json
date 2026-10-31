@@ -11,5 +11,7 @@
   "connectTimeoutMs": 10000,
   "upstreamStartupTimeoutMs": 180000,
   "maxImageQueueMiB": 256,
-  "logLevel": "info"
+  "logLevel": "info",
+  "plaintextCollaborationModels": [],
+  "earlyResponseErrorModels": []
 }

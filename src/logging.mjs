@@ -35,7 +35,8 @@ function requestLevel(entry) {
 function compactRequest(entry) {
   const compact = { event: entry.event };
   for (const key of ['requestId', 'method', 'route', 'status', 'error', 'abortSource',
-    'aborted', 'durationMs', 'upstreamRequests', 'inputBytes', 'decodedInputBytes', 'outputBytes']) {
+    'aborted', 'durationMs', 'upstreamRequests', 'inputBytes', 'decodedInputBytes', 'outputBytes',
+    'plaintextCollaboration', 'earlyResponseError']) {
     if (entry[key] !== undefined) compact[key] = entry[key];
   }
   return compact;
