@@ -9,8 +9,6 @@ export const DEFAULT_CONFIG = Object.freeze({
   maxImageQueueMiB: 256,
   logLevel: 'info',
   sessionIndexPath: null,
-  sqliteDbPath: null,
-  usageTimezone: '+08:00',
   plaintextCollaborationModels: Object.freeze([]),
   earlyResponseErrorModels: Object.freeze([]),
 });
@@ -33,14 +31,9 @@ export function validateConfig(overrides = {}, { managedUpstream = false, skipUp
     config[key] = Object.freeze([...new Set(config[key])]);
   }
   if (!LOG_LEVELS.includes(config.logLevel)) throw new Error(`logLevel must be one of: ${LOG_LEVELS.join(', ')}.`);
-  for (const key of ['sessionIndexPath', 'sqliteDbPath']) {
-    if (config[key] !== null && (typeof config[key] !== 'string' || !config[key].trim())) {
-      throw new Error(`${key} must be null or a non-empty path string.`);
-    }
-  }
-  if (typeof config.usageTimezone !== 'string' ||
-      !/^(?:Z|[+-](?:0\d|1[0-3]):[0-5]\d|[+-]14:00)$/.test(config.usageTimezone)) {
-    throw new Error('usageTimezone must be Z or a fixed UTC offset between -14:00 and +14:00 (±HH:mm).');
+  if (config.sessionIndexPath !== null &&
+      (typeof config.sessionIndexPath !== 'string' || !config.sessionIndexPath.trim())) {
+    throw new Error('sessionIndexPath must be null or a non-empty path string.');
   }
   if (!['127.0.0.1', 'localhost', '::1'].includes(config.host)) throw new Error('host must be a loopback address.');
   const integer = (key, min, max) => {
