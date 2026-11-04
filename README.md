@@ -89,6 +89,8 @@ Invoke-RestMethod 'http://127.0.0.1:4142/healthz'
   "maxImageQueueMiB": 256,
   "logLevel": "info",
   "sessionIndexPath": null,
+  "sqliteDbPath": null,
+  "usageTimezone": "+08:00",
   "plaintextCollaborationModels": [],
   "earlyResponseErrorModels": []
 }
@@ -108,6 +110,8 @@ Invoke-RestMethod 'http://127.0.0.1:4142/healthz'
 | `maxImageQueueMiB` | 图片候选请求的 worker 队列容量预算，默认 256 MiB；满时本地返回 503，不发送上游。 |
 | `logLevel` | 代理日志最低级别，默认 `info`；支持 `debug`、`info`、`warn`、`error`、`silent`，修改后手动重启生效。 |
 | `sessionIndexPath` | Codex 会话标题索引路径；默认 `null`，使用当前用户主目录下的 `.codex/session_index.jsonl`。可指定非空路径字符串，相对路径按代理进程当前目录解析。 |
+| `sqliteDbPath` | 自定义用量范围的只读 SQLite 路径。默认 `null`，依次使用 `COPILOT_API_SQLITE_DB_PATH` 环境变量或用户主目录下的 `.local/share/copilot-api/copilot-api.sqlite`；显式配置优先，相对路径按代理进程当前目录解析。启动时不要求文件存在。 |
+| `usageTimezone` | 无后缀时间的解释时区及自定义范围的日统计时区，默认 `+08:00`。支持 `Z` 或 `±HH:mm` 固定偏移，范围 `-14:00` 至 `+14:00`；不使用主机时区或夏令时。 |
 | `plaintextCollaborationModels` | 为列表内模型启用 Codex v2 明文协作适配，默认 `[]`。首版仅接受 `gpt-6-astra`、`gpt-6.1-sol`，精确匹配入站 `model`。 |
 | `earlyResponseErrorModels` | 为列表内模型启用初始 SSE 错误检查，默认 `[]`；支持相同两个模型，与明文适配独立。 |
 
@@ -121,7 +125,7 @@ Invoke-RestMethod 'http://127.0.0.1:4142/healthz'
 - 两项协作兼容配置均为空时，无图片标记且无 Unicode 转义的请求直接通过，不做 JSON 解析；存在 `input_image` 或 `\u` 候选时回退解析，防止转义图片类型漏过。配置了兼容模型列表时，普通 Responses 请求另行解析以匹配模型与工具合同。无图路径仍检查字节预算；无图的畸形 JSON 交给上游验证。
 - 图片候选请求的 JSON 与图片处理使用按需创建的单例 worker，避免这些同步计算占用 HTTP 主线程。队列有独立容量上限；worker 的性能实测以验收记录为准。
 - 两级内存缓存分别识别相同 data URL 和相同解码内容，保存最终输出 URL，重复历史图命中时避免再次解码或有损编码。缓存不把原图写到磁盘，缓存容量不等于整个服务的 RSS。
-- 支持解压 zstd、gzip 和 deflate 入站请求，向上游发送普通 JSON 并更新长度、编码相关 headers。`GET /healthz` 和 `GET /__session-titles` 由本地处理，`GET /usage-viewer` 按下述条件改写页面，其余路由按字节流透传。
+- 支持解压 zstd、gzip 和 deflate 入站请求，向上游发送普通 JSON 并更新长度、编码相关 headers。`GET /healthz` 和 `GET /__session-titles` 由本地处理；带 `from` 或 `to` 的四个用量接口按下述规则查询本地 SQLite；`GET /usage-viewer` 按下述条件改写页面，其余路由按字节流透传。
 - 默认 SSE 逐块转发；启用协作兼容时按预算预检或按事件改写，写入仍遵守背压。客户端取消会取消对应上游请求。上游 HTTP 错误透传，每个入站请求最多发出一次上游请求。Codex 自身的重试仍可能产生新的入站请求。
 
 ## 用量页面中的 Codex 会话标题
@@ -131,6 +135,22 @@ Invoke-RestMethod 'http://127.0.0.1:4142/healthz'
 标题来自 `session_index.jsonl`，按 `updated_at` 取每个 ID 的最新记录，索引的修改时间或大小变化后重新读取。文件缺失、读取失败、空标题或无法匹配时保留 ID；损坏记录跳过。subagent 线程不在该索引中，因此保留原始 ID，不读取 rollout 文件补全。
 
 此功能仅用于 Codex 会话的 Web Dashboard，不影响桌面 Electron Dashboard。只有上游返回未压缩的 200 HTML 页面且保留预期 endpoint 赋值与 `</body>` 标记时才改写；其他响应原样转发。
+
+## 自定义用量时间范围
+
+例如查看 2026 年 11 月 1 日至 3 日（默认 `+08:00`，不含 4 日零点）：
+
+```text
+http://127.0.0.1:4142/usage-viewer?from=20261101000000&to=20261104000000
+```
+
+页面把 URL 的 `from` / `to` 附加到同源的 `GET /token-usage`、`/token-usage/daily`、`/token-usage/events`、`/token-usage/sessions` 请求。它们优先于 `period`，返回 `period: "custom"`，分页参数仍生效。请使用配置的主机地址打开页面；`localhost` 和 `127.0.0.1` 是不同源，跨源 `?endpoint=` 不会收到注入的范围。没有 `from` / `to` 时保持原有上游查询。
+
+时间格式为 `YYYYMMDDHHmmss`，可加 `Z` 或 `±HHMM`。无后缀使用 `usageTimezone`；URL 中的正偏移必须编码为 `%2B`，例如 `from=20261101000000%2B0800`。范围为 `[from,to)`：包含起点、排除终点。省略 `to` 使用当前时间；省略 `from` 使用表内最早 `created_at_ms`。空表且省略 `from` 返回位于终点的空范围。日统计始终按 `usageTimezone` 分日，保留无数据的日期，首尾日裁剪到实际范围。
+
+起点早于已有数据不会报错，响应的 `data_start_ms` 标明表内最早时间（空表为 `null`）。无效日期、空参数、起点不早于终点或解析缺省边界后跨度超过 **366 天**，返回 `400`，错误类型为 `invalid_request_error`。该上限适用于四个自定义接口，避免超大日统计阻塞代理。
+
+查询兼容 `@jeffreycao/copilot-api 2.7.43` 的 `token_usage_events` 表及响应字段，包含费用、模型 timing 和会话分页。仅以 `node:sqlite` 的只读模式打开数据库，设置连接级 `busy_timeout`，不会创建数据库、迁移表或修改日志模式。数据库缺失、不可读或缺少兼容列时返回明确的 `501`；不会退回一个忽略范围的上游结果。该功能不需要改动上游服务。
 
 ## Codex v2 明文协作兼容
 

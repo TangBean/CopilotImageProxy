@@ -10,10 +10,12 @@ import { createPlaintextCollaboration, CollaborationError } from './collaboratio
 import { adaptSse, preflightSse, readJsonResponse, writeStream, ResponseStreamError, MAX_JSON_RESPONSE_BYTES } from './responses-stream.mjs';
 import { createSessionTitleReader } from './session-titles.mjs';
 import { rewriteUsageViewer } from './usage-viewer.mjs';
+import { createUsageRangeReader, UsageRangeError } from './usage-range.mjs';
 
 const decompressors = { zstd: promisify(zstdDecompress), gzip: promisify(gunzip), deflate: promisify(inflate) };
 const transformedRoutes = new Set(['/responses', '/responses/compact', '/v1/responses', '/v1/responses/compact']);
 const compatibilityRoutes = new Set(['/responses', '/v1/responses']);
+const usageRangeRoutes = new Set(['/token-usage', '/token-usage/daily', '/token-usage/events', '/token-usage/sessions']);
 const imageMarker = Buffer.from('input_image');
 const unicodeEscapeMarker = Buffer.from([0x5c, 0x75]);
 const hopHeaders = new Set(['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
@@ -69,6 +71,7 @@ async function decodeBody(raw, encoding, limit) {
 export function createProxyServer({ config: overrides = {}, log = () => {}, managedUpstream = false, useWorker = true } = {}) {
   const config = validateConfig(overrides, { managedUpstream });
   const readSessionTitles = createSessionTitleReader(config.sessionIndexPath);
+  const readUsageRange = createUsageRangeReader(config);
   const upstreamBase = new URL(config.upstream);
   const transformer = createBodyTransformer({ config, useWorker });
   const agents = { 'http:': new http.Agent({ keepAlive: true }), 'https:': new https.Agent({ keepAlive: true }) };
@@ -215,6 +218,17 @@ export function createProxyServer({ config: overrides = {}, log = () => {}, mana
         res.end(JSON.stringify(titles));
         return;
       }
+      if (req.method === 'GET' && usageRangeRoutes.has(route)) {
+        const params = new URL(req.url, 'http://localhost').searchParams;
+        if (params.has('from') || params.has('to')) {
+          metrics.route = route;
+          const usage = await readUsageRange(route, params);
+          if (signal.aborted) return;
+          res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+          res.end(JSON.stringify(usage));
+          return;
+        }
+      }
       usageViewer = req.method === 'GET' && route === '/usage-viewer';
       let body;
       const headers = headersWithoutHopByHop(req.headers);
@@ -304,6 +318,12 @@ export function createProxyServer({ config: overrides = {}, log = () => {}, mana
       }
     } catch (error) {
       if (signal.aborted || res.destroyed) return;
+      if (error instanceof UsageRangeError) {
+        metrics.error = error.type;
+        res.writeHead(error.status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+        res.end(JSON.stringify({ error: { type: error.type, message: error.message } }));
+        return;
+      }
       const local = error instanceof ProxyError ? error : error instanceof BodyTransformError || error instanceof CollaborationError
         ? new ProxyError(error.status, error.code, error.message, error.details)
         : new ProxyError(500, 'proxy_internal_error', '图片代理内部处理失败，请查看元数据日志。');

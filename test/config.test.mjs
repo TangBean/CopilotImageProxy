@@ -52,3 +52,19 @@ test('session index configuration allows the default or an explicit path without
     assert.throws(() => validateConfig({ sessionIndexPath }, { skipUpstream: true }), /sessionIndexPath/);
   }
 });
+
+test('usage range config accepts lazy database paths and fixed offsets only', () => {
+  assert.equal(validateConfig().sqliteDbPath, null);
+  assert.equal(validateConfig().usageTimezone, '+08:00');
+  assert.equal(validateConfig({ sqliteDbPath: './missing.sqlite' }).sqliteDbPath, './missing.sqlite');
+  for (const usageTimezone of ['Z', '+00:00', '-03:30', '+14:00', '-14:00']) {
+    assert.equal(validateConfig({ usageTimezone }).usageTimezone, usageTimezone);
+  }
+  for (const sqliteDbPath of ['', ' \t', false, 1, [], {}, undefined]) {
+    assert.throws(() => validateConfig({ sqliteDbPath }), /sqliteDbPath/);
+  }
+  for (const usageTimezone of ['', '+0800', 'Asia/Singapore', '+14:01', '-15:00', '+01:60', null, 8]) {
+    assert.throws(() => validateConfig({ usageTimezone }), /usageTimezone/);
+    assert.throws(() => validateConfig({ usageTimezone }, { skipUpstream: true }), /usageTimezone/);
+  }
+});

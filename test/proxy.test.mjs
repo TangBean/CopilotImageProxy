@@ -12,6 +12,7 @@ import { DEFAULT_CONFIG } from '../src/config.mjs';
 import { createProxyServer } from '../src/server.mjs';
 import { createLogger } from '../src/logging.mjs';
 import { VERSION } from '../src/version.mjs';
+import { createUsageDb } from './helpers/usage-db.mjs';
 
 const TEST_TIMEOUT = 10_000;
 const MiB = 1024 * 1024;
@@ -670,6 +671,7 @@ test('usage viewer preserves non-UTF-8 bytes outside its ASCII edits', { timeout
   assert.equal(Number(result.headers['content-length']), result.body.length);
   const restored = Buffer.from(result.body.toString('latin1')
     .replace(/<script>\nfetch\('\/__session-titles'\)[\s\S]*?<\/script>/, '')
+    .replace(/<script id="copilot-usage-range">[\s\S]*?<\/script>/, '')
     .replace('http://127.0.0.1:18042/usage', 'http://localhost:4141/usage'), 'latin1');
   assert.deepEqual(restored, bytes);
 });
@@ -695,6 +697,8 @@ test('usage viewer rewrites the configured origin and injects a static script wi
     assert.ok(!html.includes('TITLE_MUST_NOT_BE_EMBEDDED'));
     assert.match(html, /fetch\(['"]\/__session-titles['"]\)/);
     assert.match(html, /MutationObserver/);
+    assert.match(html, /<script id="copilot-usage-range">/);
+    assert.ok(html.indexOf('id="copilot-usage-range"') < html.indexOf('const DEFAULT_ENDPOINT'));
     assert.ok(html.indexOf('MutationObserver') < html.lastIndexOf('</body>'));
     assert.equal(Number(result.headers['content-length']), result.body.length);
     assert.notEqual(result.body.length, html.length, 'UTF-8 length must count bytes');
@@ -772,5 +776,74 @@ test('viewer and title additions do not intercept other methods or routes', { ti
     assert.equal(env.requests.at(-1).url, path);
     assert.equal(env.requests.at(-1).body.toString(), body);
     assert.equal(env.requests.at(-1).headers['accept-encoding'], 'gzip');
+  }
+});
+
+test('custom usage range queries temporary SQLite without calling upstream', { timeout: TEST_TIMEOUT }, async (t) => {
+  const start = Date.parse('2026-11-01T16:00:00Z');
+  const end = Date.parse('2026-11-02T16:00:00Z');
+  const fixture = await createUsageDb(t, [
+    { created_at_ms: start - 1, total_tokens: 1000, session_id: 'before' },
+    { created_at_ms: start, total_tokens: 10, session_id: 'included-a' },
+    { created_at_ms: end - 1, total_tokens: 20, session_id: 'included-b' },
+    { created_at_ms: end, total_tokens: 2000, session_id: 'after' },
+  ]);
+  const env = await setup(t, { config: { sqliteDbPath: fixture.path } });
+  const query = 'from=20261102000000&to=20261103000000&period=today&page=2&page_size=1';
+  for (const route of ['/token-usage', '/token-usage/daily', '/token-usage/events', '/token-usage/sessions']) {
+    const result = await send(env.url, { method: 'GET', path: `${route}?${query}` });
+    assert.equal(result.status, 200, result.body.toString());
+    assert.equal(result.headers['cache-control'], 'no-store');
+    const data = JSON.parse(result.body);
+    assert.equal(data.period, 'custom');
+    assert.equal(data.range.start_ms, start);
+    assert.equal(data.range.end_ms, end);
+    assert.equal(data.data_start_ms, start - 1);
+    if (data.totals) {
+      assert.equal(data.totals.request_count, 2);
+      assert.equal(data.totals.total_tokens, 30);
+    } else {
+      assert.equal(data.total, 2);
+      assert.equal(data.total_pages, 2);
+      assert.equal(data.page, 2);
+      assert.equal(data.items.length, 1);
+      assert.equal(data.items[0].session_id, 'included-a');
+    }
+    if (data.days) assert.deepEqual(data.days.map((day) => day.date), ['2026-11-02']);
+  }
+  const earliest = JSON.parse((await send(env.url, { method: 'GET', path: '/token-usage?to=20261103000000' })).body);
+  assert.equal(earliest.range.start_ms, start - 1);
+  assert.equal(earliest.totals.total_tokens, 1030);
+  assert.equal(env.requests.length, 0);
+});
+
+test('range errors are explicit and requests without a range still proxy with an unavailable DB', { timeout: TEST_TIMEOUT }, async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'copilot-proxy-missing-usage-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const env = await setup(t, { config: { sqliteDbPath: join(directory, 'missing.sqlite') } });
+  for (const query of ['from=', 'from=20260230000000', 'from=20261103000000&to=20261103000000',
+    'from=20261104000000&to=20261103000000', 'from=20240101000000&to=20260101000000']) {
+    const result = await send(env.url, { method: 'GET', path: `/token-usage?${query}` });
+    assert.equal(result.status, 400, result.body.toString());
+    assert.equal(JSON.parse(result.body).error.type, 'invalid_request_error');
+    assert.ok(JSON.parse(result.body).error.message);
+  }
+  const unavailable = await send(env.url, { method: 'GET', path: '/token-usage?from=20261102000000&to=20261103000000' });
+  assert.equal(unavailable.status, 501);
+  assert.ok(JSON.parse(unavailable.body).error.message);
+  assert.equal(env.requests.length, 0);
+  for (const route of ['/token-usage', '/token-usage/daily', '/token-usage/events', '/token-usage/sessions']) {
+    const path = `${route}?period=last_7_days&page=2`;
+    const result = await send(env.url, { method: 'GET', path });
+    assert.equal(result.status, 200);
+    assert.deepEqual(JSON.parse(result.body), { ok: true });
+    assert.equal(env.requests.at(-1).url, path);
+  }
+  for (const [method, path] of [['POST', '/token-usage?from=bad'], ['GET', '/token-usage/unknown?from=bad'],
+    ['GET', '/token-usage-extra?from=bad']]) {
+    const result = await send(env.url, { method, path });
+    assert.equal(result.status, 200);
+    assert.deepEqual(JSON.parse(result.body), { ok: true });
+    assert.equal(env.requests.at(-1).url, path);
   }
 });
