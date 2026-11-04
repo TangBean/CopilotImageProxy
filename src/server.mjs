@@ -9,11 +9,13 @@ import { VERSION } from './version.mjs';
 import { createPlaintextCollaboration, CollaborationError } from './collaboration-plaintext.mjs';
 import { adaptSse, preflightSse, readJsonResponse, writeStream, ResponseStreamError, MAX_JSON_RESPONSE_BYTES } from './responses-stream.mjs';
 import { createSessionTitleReader } from './session-titles.mjs';
-import { rewriteUsageViewer } from './usage-viewer.mjs';
+import { rewriteUsageViewer, UsageViewerError } from './usage-viewer.mjs';
+import { createUsageRangeReader, parseRelativeDayPeriod, UsageRangeError } from './usage-range.mjs';
 
 const decompressors = { zstd: promisify(zstdDecompress), gzip: promisify(gunzip), deflate: promisify(inflate) };
 const transformedRoutes = new Set(['/responses', '/responses/compact', '/v1/responses', '/v1/responses/compact']);
 const compatibilityRoutes = new Set(['/responses', '/v1/responses']);
+const usageRangeRoutes = new Set(['/token-usage', '/token-usage/daily', '/token-usage/events', '/token-usage/sessions']);
 const imageMarker = Buffer.from('input_image');
 const unicodeEscapeMarker = Buffer.from([0x5c, 0x75]);
 const hopHeaders = new Set(['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
@@ -29,6 +31,18 @@ function headersWithoutHopByHop(headers) {
   const excluded = new Set(hopHeaders);
   for (const name of String(headers.connection || '').split(',')) excluded.add(name.trim().toLowerCase());
   return Object.fromEntries(Object.entries(headers).filter(([name]) => !excluded.has(name.toLowerCase())));
+}
+
+function usageCorsHeaders(origin) {
+  const headers = { vary: 'Origin' };
+  try {
+    const url = new URL(origin);
+    if (url.origin === origin && ['http:', 'https:'].includes(url.protocol) &&
+        ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)) {
+      headers['access-control-allow-origin'] = origin;
+    }
+  } catch { /* Requests without a valid Origin do not need CORS permission. */ }
+  return headers;
 }
 
 function readBody(req, limit, signal) {
@@ -69,6 +83,7 @@ async function decodeBody(raw, encoding, limit) {
 export function createProxyServer({ config: overrides = {}, log = () => {}, managedUpstream = false, useWorker = true } = {}) {
   const config = validateConfig(overrides, { managedUpstream });
   const readSessionTitles = createSessionTitleReader(config.sessionIndexPath);
+  const readUsageRange = createUsageRangeReader(config);
   const upstreamBase = new URL(config.upstream);
   const transformer = createBodyTransformer({ config, useWorker });
   const agents = { 'http:': new http.Agent({ keepAlive: true }), 'https:': new https.Agent({ keepAlive: true }) };
@@ -83,6 +98,7 @@ export function createProxyServer({ config: overrides = {}, log = () => {}, mana
     let collaboration;
     let inspectEarlyError = false;
     let usageViewer = false;
+    let relativeUsageViewer = false;
     let responseHandled = false;
     const metrics = { requestId, method: req.method, upstreamRequests: 0 };
     let logged = false;
@@ -110,10 +126,10 @@ export function createProxyServer({ config: overrides = {}, log = () => {}, mana
     res.once('finish', finishLog);
     const failResponse = (error) => {
       if (signal.aborted || res.destroyed || res.writableEnded) return;
-      const local = error instanceof CollaborationError || error instanceof ResponseStreamError ? error
+      const local = error instanceof CollaborationError || error instanceof ResponseStreamError || error instanceof UsageViewerError ? error
         : new ResponseStreamError('proxy_upstream_stream_error', '无法读取完整上游响应。');
       metrics.error = local.code;
-      metrics.abortSource = error instanceof CollaborationError || error instanceof ResponseStreamError ? 'proxy' : 'upstream';
+      metrics.abortSource = error instanceof CollaborationError || error instanceof ResponseStreamError || error instanceof UsageViewerError ? 'proxy' : 'upstream';
       responseHandled = true;
       controller.abort(local);
       if (res.headersSent) res.destroy();
@@ -129,6 +145,10 @@ export function createProxyServer({ config: overrides = {}, log = () => {}, mana
       const success = incoming.statusCode >= 200 && incoming.statusCode < 300;
       const type = String(incoming.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
       const encoding = String(incoming.headers['content-encoding'] || '').trim().toLowerCase();
+      if (relativeUsageViewer && success &&
+          (incoming.statusCode !== 200 || type !== 'text/html' || (encoding && encoding !== 'identity'))) {
+        throw new UsageViewerError('Upstream usage viewer is incompatible: relative-day periods require an uncompressed 200 HTML response.');
+      }
       if (usageViewer && incoming.statusCode === 200 && type === 'text/html' && (!encoding || encoding === 'identity')) {
         const chunks = [];
         for await (const chunk of incoming) chunks.push(chunk);
@@ -203,6 +223,37 @@ export function createProxyServer({ config: overrides = {}, log = () => {}, mana
       if (!req.url?.startsWith('/')) throw new ProxyError(400, 'proxy_invalid_target', '请求路径必须使用 origin form。');
       const route = req.url.split('?')[0];
       metrics.route = transformedRoutes.has(route) || route === '/healthz' ? route : 'passthrough';
+      if (usageRangeRoutes.has(route) || route === '/usage-viewer') {
+        const params = new URL(req.url, 'http://localhost').searchParams;
+        if (params.has('from') || params.has('to')) {
+          throw new UsageRangeError(400, 'invalid_request_error', 'Use period=-1day through -10day; explicit date boundaries are not supported.');
+        }
+        if (params.getAll('period').length > 1) {
+          throw new UsageRangeError(400, 'invalid_request_error', 'Specify period only once.');
+        }
+        const relativePeriod = parseRelativeDayPeriod(params.get('period'));
+        relativeUsageViewer = req.method === 'GET' && route === '/usage-viewer' && relativePeriod !== null;
+        if (req.method === 'OPTIONS' && usageRangeRoutes.has(route) && relativePeriod !== null) {
+          res.writeHead(204, {
+            ...usageCorsHeaders(req.headers.origin), 'cache-control': 'no-store',
+            'access-control-allow-methods': 'GET',
+            'access-control-allow-headers': 'content-type, authorization, x-api-key',
+          });
+          res.end();
+          return;
+        }
+        if (req.method === 'GET' && usageRangeRoutes.has(route)) {
+          const usage = await readUsageRange(route, params);
+          if (usage !== null) {
+            if (signal.aborted) return;
+            metrics.route = route;
+            res.writeHead(200, { ...usageCorsHeaders(req.headers.origin),
+              'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+            res.end(JSON.stringify(usage));
+            return;
+          }
+        }
+      }
       if (req.method === 'GET' && route === '/healthz') {
         res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
         res.end(JSON.stringify({ service: 'copilot-image-proxy', status: 'ok', pid: process.pid, version: VERSION }));
@@ -304,6 +355,13 @@ export function createProxyServer({ config: overrides = {}, log = () => {}, mana
       }
     } catch (error) {
       if (signal.aborted || res.destroyed) return;
+      if (error instanceof UsageRangeError) {
+        metrics.error = error.type;
+        res.writeHead(error.status, { ...usageCorsHeaders(req.headers.origin),
+          'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+        res.end(JSON.stringify({ error: { type: error.type, message: error.message } }));
+        return;
+      }
       const local = error instanceof ProxyError ? error : error instanceof BodyTransformError || error instanceof CollaborationError
         ? new ProxyError(error.status, error.code, error.message, error.details)
         : new ProxyError(500, 'proxy_internal_error', '图片代理内部处理失败，请查看元数据日志。');

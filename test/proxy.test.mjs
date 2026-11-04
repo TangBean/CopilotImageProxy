@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { once } from 'node:events';
-import { mkdtemp, mkdir, writeFile, utimes, unlink, rmdir, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, utimes, unlink, rmdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -648,7 +648,7 @@ test('missing or unreadable session indexes return empty mappings and recover wi
   assert.equal(env.requests.length, 1);
 });
 
-const usageViewerHtml = '<!doctype html><html><body><p>会话统计</p><script>const DEFAULT_ENDPOINT = "http://localhost:4141/usage";</script></body></html>';
+const usageViewerHtml = await readFile(new URL('./fixtures/usage-viewer.upstream.html', import.meta.url), 'utf8');
 const viewerValidators = {
   etag: '"upstream-html"', 'content-md5': 'upstream-md5', digest: 'sha-256=upstream-digest',
   'content-digest': 'sha-256=:upstream-digest:', 'repr-digest': 'sha-256=:upstream-digest:',
@@ -668,10 +668,8 @@ test('usage viewer preserves non-UTF-8 bytes outside its ASCII edits', { timeout
   assert.ok(result.body.includes('http://127.0.0.1:18042/usage'));
   assert.ok(result.body.includes('MutationObserver'));
   assert.equal(Number(result.headers['content-length']), result.body.length);
-  const restored = Buffer.from(result.body.toString('latin1')
-    .replace(/<script>\nfetch\('\/__session-titles'\)[\s\S]*?<\/script>/, '')
-    .replace('http://127.0.0.1:18042/usage', 'http://localhost:4141/usage'), 'latin1');
-  assert.deepEqual(restored, bytes);
+  assert.deepEqual(result.body.subarray(0, result.body.indexOf('<script>')), bytes.subarray(0, bytes.indexOf('<script>')));
+  assert.deepEqual(result.body.subarray(result.body.lastIndexOf('</body>')), bytes.subarray(bytes.lastIndexOf('</body>')));
 });
 
 test('usage viewer rewrites the configured origin and injects a static script with correct headers', { timeout: TEST_TIMEOUT }, async (t) => {
@@ -707,13 +705,10 @@ test('usage viewer rewrites the configured origin and injects a static script wi
 });
 
 test('usage viewer passes unsupported responses through with original status, headers, and bytes', { timeout: TEST_TIMEOUT }, async (t) => {
-  const invalidUtf8 = Buffer.from([0xff, 0x80]);
   const cases = [
     { name: 'non-html', type: 'text/plain', body: Buffer.from(usageViewerHtml) },
     { name: 'non-200', status: 503, body: Buffer.from(usageViewerHtml) },
     { name: 'compressed', encoding: 'gzip', body: gzipSync(usageViewerHtml) },
-    { name: 'missing-endpoint', body: Buffer.concat([invalidUtf8, Buffer.from('<html><body>unchanged</body></html>')]) },
-    { name: 'missing-body', body: Buffer.concat([invalidUtf8, Buffer.from(usageViewerHtml.replace('</body>', ''))]) },
     { name: 'missing-content-type', type: null, body: Buffer.from(usageViewerHtml) },
   ];
   const env = await setup(t, { handle: (req, res) => {
@@ -733,6 +728,47 @@ test('usage viewer passes unsupported responses through with original status, he
     assert.equal(result.headers['x-upstream-marker'], fixture.name);
     for (const [header, value] of Object.entries(viewerValidators)) assert.equal(result.headers[header], value, `${fixture.name}: ${header}`);
     assert.equal(env.requests.at(-1).headers['accept-encoding'], 'identity');
+  }
+});
+
+test('relative-day viewer rejects incompatible successful responses instead of serving an unpatched page', { timeout: TEST_TIMEOUT }, async (t) => {
+  for (const fixture of [
+    { type: 'text/html', encoding: 'gzip', body: gzipSync(usageViewerHtml) },
+    { type: 'text/plain', body: Buffer.from(usageViewerHtml) },
+    { body: Buffer.from(usageViewerHtml) },
+    { type: 'text/html', status: 201, body: Buffer.from(usageViewerHtml) },
+  ]) {
+    const env = await setup(t, { handle: (_req, res) => {
+      const headers = { 'content-length': String(fixture.body.length) };
+      if (fixture.type) headers['content-type'] = fixture.type;
+      if (fixture.encoding) headers['content-encoding'] = fixture.encoding;
+      res.writeHead(fixture.status ?? 200, headers);
+      res.end(fixture.body);
+    } });
+    const result = await send(env.url, { method: 'GET', path: '/usage-viewer?period=-1day' });
+    assert.equal(result.status, 502);
+    assert.equal(JSON.parse(result.body).error.code, 'proxy_usage_viewer_incompatible');
+    assert.equal(env.requests.length, 1);
+  }
+});
+
+test('usage viewer reports incompatible HTML markers instead of returning an unpatched Today page', { timeout: TEST_TIMEOUT }, async (t) => {
+  const cases = [
+    usageViewerHtml.replace('const DEFAULT_ENDPOINT', 'const CHANGED_ENDPOINT'),
+    usageViewerHtml.replace('</body>', ''),
+    usageViewerHtml.replace('function normalizePeriod(', 'function changedNormalizePeriod('),
+    usageViewerHtml.replace('</body>', '</body></body>'),
+  ];
+  for (const body of cases) {
+    const env = await setup(t, { handle: (_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/html' });
+      res.end(body);
+    } });
+    const result = await send(env.url, { method: 'GET', path: '/usage-viewer?period=-1day' });
+    assert.equal(result.status, 502);
+    const error = JSON.parse(result.body).error;
+    assert.equal(error.code, 'proxy_usage_viewer_incompatible');
+    assert.match(error.message, /marker|upstream/i);
   }
 });
 

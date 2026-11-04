@@ -52,3 +52,22 @@ test('session index configuration allows the default or an explicit path without
     assert.throws(() => validateConfig({ sessionIndexPath }, { skipUpstream: true }), /sessionIndexPath/);
   }
 });
+
+test('usage database path and fixed timezone validate without opening a database', () => {
+  assert.equal(validateConfig().sqliteDbPath, null);
+  assert.equal(validateConfig().usageTimezone, '+08:00');
+  for (const sqliteDbPath of [null, './missing-usage.sqlite', join(tmpdir(), 'missing-usage.sqlite')]) {
+    assert.equal(validateConfig({ sqliteDbPath }).sqliteDbPath, sqliteDbPath);
+  }
+  for (const sqliteDbPath of ['', ' \t', 0, false, [], {}, undefined]) {
+    assert.throws(() => validateConfig({ sqliteDbPath }), /sqliteDbPath/);
+    assert.throws(() => validateConfig({ sqliteDbPath }, { skipUpstream: true }), /sqliteDbPath/);
+  }
+  for (const usageTimezone of ['+08:00', 'Z', '-05:00', '+05:30', '-14:00', '+14:00']) {
+    assert.equal(validateConfig({ usageTimezone }).usageTimezone, usageTimezone);
+  }
+  for (const usageTimezone of [null, undefined, 8, '', 'UTC', 'Asia/Singapore', '+0800', '+14:01', '-15:00', '+05:60', '+08:00\n', 'Z\r']) {
+    assert.throws(() => validateConfig({ usageTimezone }), /usageTimezone/);
+    assert.throws(() => validateConfig({ usageTimezone }, { skipUpstream: true }), /usageTimezone/);
+  }
+});

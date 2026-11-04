@@ -89,6 +89,8 @@ Invoke-RestMethod 'http://127.0.0.1:4142/healthz'
   "maxImageQueueMiB": 256,
   "logLevel": "info",
   "sessionIndexPath": null,
+  "sqliteDbPath": null,
+  "usageTimezone": "+08:00",
   "plaintextCollaborationModels": [],
   "earlyResponseErrorModels": []
 }
@@ -108,6 +110,8 @@ Invoke-RestMethod 'http://127.0.0.1:4142/healthz'
 | `maxImageQueueMiB` | 图片候选请求的 worker 队列容量预算，默认 256 MiB；满时本地返回 503，不发送上游。 |
 | `logLevel` | 代理日志最低级别，默认 `info`；支持 `debug`、`info`、`warn`、`error`、`silent`，修改后手动重启生效。 |
 | `sessionIndexPath` | Codex 会话标题索引路径；默认 `null`，使用当前用户主目录下的 `.codex/session_index.jsonl`。可指定非空路径字符串，相对路径按代理进程当前目录解析。 |
+| `sqliteDbPath` | 相对日用量的只读 SQLite 路径；默认 `null`，依次使用 `COPILOT_API_SQLITE_DB_PATH` 环境变量或 `~/.local/share/copilot-api/copilot-api.sqlite`。可指定非空路径，相对路径按代理进程当前目录解析。 |
+| `usageTimezone` | 相对日的自然日时区，默认 `+08:00`；支持 `Z` 或 `-14:00` 到 `+14:00` 的固定 UTC 偏移（`±HH:mm`），例如 `-05:00`、`+05:30`。不支持地区名或夏令时切换。 |
 | `plaintextCollaborationModels` | 为列表内模型启用 Codex v2 明文协作适配，默认 `[]`。首版仅接受 `gpt-6-astra`、`gpt-6.1-sol`，精确匹配入站 `model`。 |
 | `earlyResponseErrorModels` | 为列表内模型启用初始 SSE 错误检查，默认 `[]`；支持相同两个模型，与明文适配独立。 |
 
@@ -121,16 +125,22 @@ Invoke-RestMethod 'http://127.0.0.1:4142/healthz'
 - 两项协作兼容配置均为空时，无图片标记且无 Unicode 转义的请求直接通过，不做 JSON 解析；存在 `input_image` 或 `\u` 候选时回退解析，防止转义图片类型漏过。配置了兼容模型列表时，普通 Responses 请求另行解析以匹配模型与工具合同。无图路径仍检查字节预算；无图的畸形 JSON 交给上游验证。
 - 图片候选请求的 JSON 与图片处理使用按需创建的单例 worker，避免这些同步计算占用 HTTP 主线程。队列有独立容量上限；worker 的性能实测以验收记录为准。
 - 两级内存缓存分别识别相同 data URL 和相同解码内容，保存最终输出 URL，重复历史图命中时避免再次解码或有损编码。缓存不把原图写到磁盘，缓存容量不等于整个服务的 RSS。
-- 支持解压 zstd、gzip 和 deflate 入站请求，向上游发送普通 JSON 并更新长度、编码相关 headers。`GET /healthz` 和 `GET /__session-titles` 由本地处理，`GET /usage-viewer` 按下述条件改写页面，其余路由按字节流透传。
+- 支持解压 zstd、gzip 和 deflate 入站请求，向上游发送普通 JSON 并更新长度、编码相关 headers。`GET /healthz`、`GET /__session-titles` 和下述相对日用量查询由本地处理，`GET /usage-viewer` 按下述条件改写页面，其余路由按字节流透传。
 - 默认 SSE 逐块转发；启用协作兼容时按预算预检或按事件改写，写入仍遵守背压。客户端取消会取消对应上游请求。上游 HTTP 错误透传，每个入站请求最多发出一次上游请求。Codex 自身的重试仍可能产生新的入站请求。
 
-## 用量页面中的 Codex 会话标题
+## 用量页面：相对自然日与 Codex 会话标题
 
 通过代理打开 `http://127.0.0.1:4142/usage-viewer`，Session Breakdown 中已匹配的 Codex 会话显示标题，鼠标悬浮显示原始 ID。修改代理监听地址或端口后，使用对应的页面地址；页面默认数据 endpoint 也使用代理的配置地址，`?endpoint=` 仍可覆盖。
 
+使用 `http://127.0.0.1:4142/usage-viewer?period=-1day` 查看昨天，`period=-2day` 查看前天，最多支持 `period=-10day`。每个值只选中 **N 天前的一个自然日**，以 `usageTimezone` 的 00:00 为起点、次日 00:00 为终点，包含起点、不包含终点。例如当地今天为 2026-11-04 时，`-2day` 查询 2026-11-02 全天；`-1day` 的终点恰好是今天 00:00。
+
+`GET /token-usage`、`/token-usage/daily`、`/token-usage/events`、`/token-usage/sessions` 均支持相同的 `period`。忽略大小写，允许数字与 `day` 之间有一个空格或下划线：`-1%20Day`、`-1+Day`、`-1_day` 均规范化为 `-1day`。只接受 1–10 的整数，不接受零、前导零、小数、缺少 `day` 或额外后缀；无效相对日返回 400，`-0day` 不代表今天。`today` 等原有周期保持上游行为。
+
+相对日查询复用 copilot-api v2.7.43 的 `token_usage_events` 表结构，以只读事务查询本地 SQLite；不会修改数据库。数据库不可读或结构不兼容时返回 501，不改查今天。响应保持 `period: "custom"`，`range` 提供毫秒和 UTC 起止时间，以及形如 `2026-11-02 (-2 Day)` 的 `display_label`。页面下拉框会增加当前相对日，选择与 URL 保持同步。覆盖 `endpoint` 时，相对日功能要求目标也支持这些周期。
+
 标题来自 `session_index.jsonl`，按 `updated_at` 取每个 ID 的最新记录，索引的修改时间或大小变化后重新读取。文件缺失、读取失败、空标题或无法匹配时保留 ID；损坏记录跳过。subagent 线程不在该索引中，因此保留原始 ID，不读取 rollout 文件补全。
 
-此功能仅用于 Codex 会话的 Web Dashboard，不影响桌面 Electron Dashboard。只有上游返回未压缩的 200 HTML 页面且保留预期 endpoint 赋值与 `</body>` 标记时才改写；其他响应原样转发。
+此功能仅用于 Web Dashboard，不影响桌面 Electron Dashboard。上游返回未压缩的 200 HTML 页面时，代理按唯一的上游代码标记改写周期校验、初始化和 URL 同步；标记缺失或重复会明确返回 502，避免把相对日静默显示为 Today。请求相对日页面时，上游若返回压缩内容或其他不兼容的成功响应，也返回 502；其他响应保持透传。本地相对日 API 支持来自 `localhost`、`127.0.0.1` 和 `[::1]` 的 HTTP(S) 跨来源访问及预检，便于切换本机页面地址或 endpoint。
 
 ## Codex v2 明文协作兼容
 

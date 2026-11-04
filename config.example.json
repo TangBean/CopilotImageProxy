@@ -13,6 +13,8 @@
   "maxImageQueueMiB": 256,
   "logLevel": "info",
   "sessionIndexPath": null,
+  "sqliteDbPath": null,
+  "usageTimezone": "+08:00",
   "plaintextCollaborationModels": [],
   "earlyResponseErrorModels": []
 }

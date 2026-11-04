@@ -1,5 +1,81 @@
 const defaultEndpoint = 'const DEFAULT_ENDPOINT = "http://localhost:4141/usage";';
 
+const periodSelectMarker = `<select
+                id="token-usage-period"
+                class="select-control input-focus"
+              >`;
+
+const periodSelectBindingMarker = `const tokenUsagePeriodSelect = document.getElementById(
+          "token-usage-period"
+        );`;
+
+const normalizePeriodMarker = `function normalizePeriod(value) {
+          if (VALID_PERIODS.has(value)) {
+            return value;
+          }
+          return LEGACY_PERIODS[value] || DEFAULT_TOKEN_USAGE_PERIOD;
+        }`;
+
+const relativePeriodNormalizer = `function normalizePeriod(value) {
+          const relative = typeof value === "string" && /^-([1-9]|10)[ _]?day$/i.exec(value);
+          if (relative && relative[0] === value) {
+            return "-" + relative[1] + "day";
+          }
+          if (/^\\s*-/.test(value || "")) {
+            throw new Error("Relative-day period must be -1day through -10day, with one optional space or underscore before day.");
+          }
+          if (VALID_PERIODS.has(value)) {
+            return value;
+          }
+          return Object.hasOwn(LEGACY_PERIODS, value) ? LEGACY_PERIODS[value] : DEFAULT_TOKEN_USAGE_PERIOD;
+        }`;
+
+const resolveUsageUrlMarker = `function resolveUsageUrl(endpoint) {
+          return new URL(endpoint, window.location.href).toString();
+        }`;
+
+const validatedUsageUrl = `function resolveUsageUrl(endpoint) {
+          const url = new URL(endpoint, window.location.href);
+          if (url.searchParams.has("from") || url.searchParams.has("to")) {
+            throw new Error("from and to are not supported. Use period=-1day through period=-10day.");
+          }
+          return url.toString();
+        }`;
+
+const deriveEndpointMarker = `function deriveEndpointUrl(usageEndpoint, targetPath) {
+          const url = new URL(usageEndpoint, window.location.href);`;
+
+const periodInitializationMarker = `const periodFromUrl = normalizePeriod(urlParams.get("period"));
+          const endpointFromUrl = urlParams.get("endpoint");
+          const initialEndpoint = endpointFromUrl || DEFAULT_ENDPOINT;`;
+
+const relativePeriodInitialization = `const endpointFromUrl = urlParams.get("endpoint");
+          const initialEndpoint = endpointFromUrl || DEFAULT_ENDPOINT;
+          let periodFromUrl;
+          try {
+            if (urlParams.has("from") || urlParams.has("to")) {
+              throw new Error("from and to are not supported. Use period=-1day through period=-10day.");
+            }
+            if (urlParams.getAll("period").length > 1) {
+              throw new Error("period must be specified once.");
+            }
+            periodFromUrl = normalizePeriod(urlParams.get("period"));
+            resolveUsageUrl(initialEndpoint);
+          } catch (error) {
+            state.error = getErrorMessage(error);
+            render();
+            return;
+          }
+          if (periodFromUrl.startsWith("-")) {
+            const option = document.createElement("option");
+            option.value = periodFromUrl;
+            option.textContent = periodFromUrl.replace("day", " Day");
+            tokenUsagePeriodSelect.add(option);
+            const currentUrl = new URL(window.location.href);
+            currentUrl.searchParams.set("period", periodFromUrl);
+            window.history.replaceState({}, "", currentUrl);
+          }`;
+
 const sessionTitlesScript = `<script>
 fetch('/__session-titles')
   .then((response) => response.ok ? response.json() : {})
@@ -33,12 +109,59 @@ fetch('/__session-titles')
   .catch(() => {});
 </script>`;
 
+export class UsageViewerError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'UsageViewerError';
+    this.status = 502;
+    this.code = 'proxy_usage_viewer_incompatible';
+  }
+}
+
+function uniqueEdit(body, name, marker, replacement) {
+  const variants = marker.includes('\n') ? [marker, marker.replaceAll('\n', '\r\n')] : [marker];
+  const matches = [];
+  for (const variant of variants) {
+    const bytes = Buffer.from(variant);
+    for (let start = body.indexOf(bytes); start >= 0; start = body.indexOf(bytes, start + 1)) {
+      matches.push({
+        start, length: bytes.length,
+        replacement: Buffer.from(variant.includes('\r\n') ? replacement.replaceAll('\n', '\r\n') : replacement),
+      });
+    }
+  }
+  if (matches.length !== 1) {
+    throw new UsageViewerError(`Upstream usage viewer is incompatible: ${name} marker is ${matches.length ? 'duplicated' : 'missing'}.`);
+  }
+  return matches[0];
+}
+
 export function rewriteUsageViewer(body, { host, port }) {
-  const endpointStart = body.indexOf(defaultEndpoint);
-  if (endpointStart < 0 || !body.includes('</body>')) return null;
   const authority = host === '::1' ? `[${host}]:${port}` : `${host}:${port}`;
-  const endpoint = Buffer.from(`const DEFAULT_ENDPOINT = "http://${authority}/usage";`);
-  const html = Buffer.concat([body.subarray(0, endpointStart), endpoint, body.subarray(endpointStart + defaultEndpoint.length)]);
-  const bodyEnd = html.lastIndexOf('</body>');
-  return Buffer.concat([html.subarray(0, bodyEnd), Buffer.from(sessionTitlesScript), html.subarray(bodyEnd)]);
+  const edits = [
+    ['default endpoint', defaultEndpoint, `const DEFAULT_ENDPOINT = "http://${authority}/usage";`],
+    ['period select', periodSelectMarker, periodSelectMarker],
+    ['period select binding', periodSelectBindingMarker, periodSelectBindingMarker],
+    ['period normalization', normalizePeriodMarker, relativePeriodNormalizer],
+    ['usage endpoint validation', resolveUsageUrlMarker, validatedUsageUrl],
+    ['derived endpoint validation', deriveEndpointMarker,
+      'function deriveEndpointUrl(usageEndpoint, targetPath) {\n          const url = new URL(resolveUsageUrl(usageEndpoint));'],
+    ['period initialization', periodInitializationMarker, relativePeriodInitialization],
+    ['range label', 'const label = labels[period] || labels.today;', `if (typeof range?.display_label === "string" && range.display_label) {
+            return range.display_label;
+          }
+          const label = labels[period] || period;`],
+    ['closing body', '</body>', `${sessionTitlesScript}</body>`],
+  ].map(([name, marker, replacement]) => uniqueEdit(body, name, marker, replacement))
+    .sort((left, right) => left.start - right.start);
+
+  const chunks = [];
+  let end = 0;
+  for (const edit of edits) {
+    if (edit.start < end) throw new UsageViewerError('Upstream usage viewer is incompatible: rewrite markers overlap.');
+    chunks.push(body.subarray(end, edit.start), edit.replacement);
+    end = edit.start + edit.length;
+  }
+  chunks.push(body.subarray(end));
+  return Buffer.concat(chunks);
 }
