@@ -17,12 +17,12 @@ const normalizePeriodMarker = `function normalizePeriod(value) {
         }`;
 
 const relativePeriodNormalizer = `function normalizePeriod(value) {
-          const relative = typeof value === "string" && /^-([1-9]|10)[ _]?day$/i.exec(value);
-          if (relative && relative[0] === value) {
+          const relative = typeof value === "string" && /^-([1-9][0-9]*)[ _]?d(?:ay)?$/i.exec(value);
+          if (relative && relative[0] === value && Number.isSafeInteger(Number(relative[1]))) {
             return "-" + relative[1] + "day";
           }
           if (/^\\s*-/.test(value || "")) {
-            throw new Error("Relative-day period must be -1day through -10day, with one optional space or underscore before day.");
+            throw new Error("Relative-day period must be -Nd or -Nday with a positive safe integer N, no leading zeros, and one optional space or underscore before the suffix.");
           }
           if (VALID_PERIODS.has(value)) {
             return value;
@@ -37,7 +37,7 @@ const resolveUsageUrlMarker = `function resolveUsageUrl(endpoint) {
 const validatedUsageUrl = `function resolveUsageUrl(endpoint) {
           const url = new URL(endpoint, window.location.href);
           if (url.searchParams.has("from") || url.searchParams.has("to")) {
-            throw new Error("from and to are not supported. Use period=-1day through period=-10day.");
+            throw new Error("from and to are not supported. Use period=-Nd or period=-Nday.");
           }
           return url.toString();
         }`;
@@ -54,7 +54,7 @@ const relativePeriodInitialization = `const endpointFromUrl = urlParams.get("end
           let periodFromUrl;
           try {
             if (urlParams.has("from") || urlParams.has("to")) {
-              throw new Error("from and to are not supported. Use period=-1day through period=-10day.");
+              throw new Error("from and to are not supported. Use period=-Nd or period=-Nday.");
             }
             if (urlParams.getAll("period").length > 1) {
               throw new Error("period must be specified once.");

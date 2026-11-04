@@ -260,6 +260,32 @@
           }
         }
 
+        // pages/index.html:1066-1089
+        function updateControls() {
+          const isLoading =
+            state.activeTab === "models"
+              ? state.isModelsLoading
+              : state.isLoading;
+          fetchButton.disabled = isLoading;
+          fetchButtonLabel.textContent = isLoading
+            ? "Refreshing..."
+            : "Refresh";
+          tokenUsagePeriodSelect.disabled =
+            state.isLoading || state.isTokenUsageLoading;
+          periodField.hidden = state.activeTab === "models";
+          endpointForm.classList.toggle(
+            "models-view",
+            state.activeTab === "models"
+          );
+          contentArea.setAttribute("aria-labelledby", `${state.activeTab}-tab`);
+          contentArea.setAttribute("aria-busy", String(isLoading));
+          for (const button of tabButtons) {
+            const selected = button.dataset.tab === state.activeTab;
+            button.setAttribute("aria-selected", String(selected));
+            button.tabIndex = selected ? 0 : -1;
+          }
+        }
+
         // pages/index.html:1181-1215
         function formatRangeDate(value) {
           const date = new Date(value);
@@ -690,6 +716,75 @@
           state.isSessionsLoading = false;
           state.tokenUsageSessionsPage = null;
           state.tokenUsageSessionsError = null;
+        }
+
+        // pages/index.html:1481-1497
+        function getModelsConnectionKey() {
+          return JSON.stringify([
+            endpointUrlInput.value.trim(),
+            apiKeyInput.value.trim(),
+          ]);
+        }
+
+        function syncModelsConnection() {
+          const key = getModelsConnectionKey();
+          if (state.modelsConnectionKey !== key) {
+            state.modelsConnectionKey = key;
+            state.modelsRequestId += 1;
+            state.models = null;
+            state.modelsError = null;
+            state.isModelsLoading = false;
+          }
+        }
+
+        // pages/index.html:1506-1553
+        async function fetchModels() {
+          syncEndpointCredential();
+          syncModelsConnection();
+          const connectionKey = state.modelsConnectionKey;
+          const requestId = ++state.modelsRequestId;
+          const isCurrentRequest = () =>
+            requestId === state.modelsRequestId
+            && connectionKey === getModelsConnectionKey();
+          state.models = null;
+          state.modelsError = null;
+          state.isModelsLoading = true;
+          render("models");
+          try {
+            const endpoint = endpointUrlInput.value.trim();
+            if (!endpoint) {
+              throw new Error("Endpoint URL cannot be empty.");
+            }
+            const payload = await fetchJson(deriveEndpointUrl(endpoint, "models"));
+            if (!Array.isArray(payload?.data)) {
+              throw new Error("Model response must contain a data array.");
+            }
+            if (isCurrentRequest()) {
+              state.models = payload.data;
+            }
+          } catch (error) {
+            if (isCurrentRequest()) {
+              state.modelsError = getErrorMessage(error);
+            }
+          } finally {
+            if (isCurrentRequest()) {
+              state.isModelsLoading = false;
+              render("models");
+            }
+          }
+        }
+
+        function activateTab(tab) {
+          if (tab !== "usage" && tab !== "models") {
+            return;
+          }
+          syncEndpointCredential();
+          syncModelsConnection();
+          state.activeTab = tab;
+          render();
+          if (tab === "models" && !state.models && !state.isModelsLoading) {
+            void fetchModels();
+          }
         }
 
         // pages/index.html:2958-2973

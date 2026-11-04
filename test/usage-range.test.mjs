@@ -38,9 +38,9 @@ async function fixture(t) {
 }
 
 test('relative-day periods accept exact spellings and canonicalize case and one separator', () => {
-  for (let day = 1; day <= 10; day++) {
+  for (const day of [1, 2, 10, 11, 34, 365, 1000, 20000, Number.MAX_SAFE_INTEGER]) {
     for (const separator of ['', ' ', '_']) {
-      for (const suffix of ['day', 'Day', 'DAY']) {
+      for (const suffix of ['d', 'D', 'day', 'Day', 'DAY']) {
         assert.equal(parseRelativeDayPeriod(`-${day}${separator}${suffix}`), `-${day}day`);
       }
     }
@@ -51,7 +51,8 @@ test('relative-day periods accept exact spellings and canonicalize case and one 
 });
 
 test('malformed relative-day candidates fail without trimming or accepting numeric lookalikes', () => {
-  for (const value of ['-', '-0day', '-11day', '-01day', '-00day', '-1', '-1.0day', '-1.5day',
+  for (const value of ['-', '-0d', '-0day', '-01d', '-01day', '-00day', '-1', '-1.0day', '-1.5day',
+    '-1.5d', '-xd', '-1dextra', '-9007199254740992d', `-${'9'.repeat(400)}day`,
     '-1e0day', '-oneday', '-nday', '-1days', '-1dayago', '--1day', '-today', '- 1day',
     '-1  day', '-1__day', '-1 _day', '-1day ', ' -1day', '-1day\n', '\t-1day', '-1\tday', '-1\u00a0day']) {
     assert.throws(() => parseRelativeDayPeriod(value), invalidRequest, JSON.stringify(value));
@@ -59,11 +60,15 @@ test('malformed relative-day candidates fail without trimming or accepting numer
 });
 
 test('URL decoding preserves the accepted space and underscore spellings and rejects extra characters', () => {
-  for (const encoded of ['-1day', '-1%20day', '-1+day', '-1_day', '%2D10%20DAY']) {
+  for (const [encoded, canonical] of [
+    ['-1day', '-1day'], ['-1%20day', '-1day'], ['-1+day', '-1day'], ['-1_day', '-1day'],
+    ['%2D10%20DAY', '-10day'], ['-11d', '-11day'], ['-34%20D', '-34day'],
+    ['-365+d', '-365day'], ['-1000_D', '-1000day'],
+  ]) {
     const params = new URLSearchParams(`period=${encoded}`);
-    assert.equal(parseRelativeDayPeriod(params.get('period')), encoded.includes('10') ? '-10day' : '-1day');
+    assert.equal(parseRelativeDayPeriod(params.get('period')), canonical);
   }
-  for (const encoded of ['-0day', '-11day', '-01day', '-1%20%20day', '-1day%20', '%20-1day',
+  for (const encoded of ['-0d', '-0day', '-01d', '-01day', '-1%20%20day', '-1day%20', '%20-1day',
     '-1%2Bday', '-1%2Fday', '-1day%0A']) {
     assert.throws(() => parseRelativeDayPeriod(new URLSearchParams(`period=${encoded}`).get('period')), invalidRequest);
   }
@@ -75,17 +80,51 @@ test('relative-day ranges select one natural day across month, year and leap-day
     ['2024-03-01T08:00:00Z', '-1day', '2024-02-29'],
     ['2027-01-01T08:00:00Z', '-1day', '2026-12-31'],
     ['2026-01-05T08:00:00Z', '-10day', '2025-12-26'],
+    ['2026-11-04T08:00:00Z', '-34d', '2026-10-01'],
+    ['2026-01-05T08:00:00Z', '-365DAY', '2025-01-05'],
+    ['2024-04-03T08:00:00Z', '-34_D', '2024-02-29'],
+    ['2025-03-01T08:00:00Z', '-366d', '2024-02-29'],
   ]) {
     const range = createRelativeDayRange(period, 'Z', Date.parse(clock));
     assert.equal(range.date, date);
     assert.equal(range.startMs, Date.parse(`${date}T00:00:00Z`));
     assert.equal(range.endMs - range.startMs, DAY);
-    assert.equal(range.displayLabel, `${date} (${period.replace('day', ' Day')})`);
+    assert.equal(range.displayLabel, `${date} (-${parseInt(period.slice(1), 10)} Day)`);
   }
   const beforeMidnight = createRelativeDayRange('-1day', '+08:00', Date.parse('2026-11-03T15:59:59.999Z'));
   const atMidnight = createRelativeDayRange('-1day', '+08:00', Date.parse('2026-11-03T16:00:00Z'));
   assert.equal(beforeMidnight.date, '2026-11-02');
   assert.equal(atMidnight.date, '2026-11-03');
+});
+
+test('relative-day ranges accept the local epoch day and reject earlier targets before date arithmetic', () => {
+  for (const [timezone, offset] of [['+08:00', 480], ['Z', 0], ['-05:00', -300], ['+05:30', 330],
+    ['+14:00', 840], ['-14:00', -840]]) {
+    const clock = Date.parse('2026-11-04T18:45:00Z');
+    const days = Math.floor((clock + offset * 60000) / DAY);
+    const range = createRelativeDayRange(`-${days}d`, timezone, clock);
+    assert.equal(range.date, '1970-01-01', timezone);
+    assert.equal(range.startMs, 0 - offset * 60000, timezone);
+    assert.equal(range.endMs, DAY - offset * 60000, timezone);
+    for (const period of [`-${days + 1}d`, '-99999999d', '-9007199254740991day', '-9007199254740992d',
+      `-${'9'.repeat(400)}d`]) {
+      assert.throws(() => createRelativeDayRange(period, timezone, clock), invalidRequest, `${timezone} ${period}`);
+    }
+  }
+});
+
+test('invalid clocks return request errors and valid extreme clocks preserve complete ISO dates', () => {
+  for (const clock of [NaN, Infinity, -Infinity, 8640000000000001, -8640000000000001, '2026-01-01']) {
+    assert.throws(() => createRelativeDayRange('-34d', 'Z', clock), invalidRequest);
+  }
+  for (const timezone of ['-14:00', 'Z', '+14:00']) {
+    const range = createRelativeDayRange('-1d', timezone, 8640000000000000);
+    assert.match(range.date, /^\+\d{6}-\d{2}-\d{2}$/);
+    assert.ok(Number.isFinite(new Date(range.startMs).getTime()));
+    assert.ok(Number.isFinite(new Date(range.endMs).getTime()));
+  }
+  assert.throws(() => createRelativeDayRange('-1d', 'Z', Date.parse('1970-01-01T12:00:00Z')), invalidRequest);
+  assert.equal(createRelativeDayRange('-1d', 'Z', Date.parse('1970-01-02T00:00:00Z')).date, '1970-01-01');
 });
 
 test('relative-day range boundaries follow +08:00, Z, -05:00 and +05:30', () => {
@@ -108,7 +147,7 @@ test('invalid periods, from/to and timezone fail before opening any database', a
   const options = { now: () => now, openDatabase: () => { opens++; throw new Error('must not open'); } };
   const read = createUsageRangeReader({}, options);
   for (const route of routes) {
-    for (const params of [query({ period: '-0day' }), query({ period: '-11day' }),
+    for (const params of [query({ period: '-0d' }), query({ period: '-0day' }), query({ period: '-99999999d' }),
       query({ period: '-01day' }), query({ period: '-1' }), query({ period: '-1.5day' }),
       query({ period: '-oneday' }), query({ period: '-1days' }), query({ period: '-1day ' }),
       query({ from: '' }), query({ to: '' }), query({ from: '20260102000000', to: '20260103000000' }),
@@ -183,9 +222,9 @@ test('daily returns one complete natural-day bucket, including an empty day befo
     date: '2026-01-02', start_ms: start, end_ms: end,
     byModel: result.byModel, totals: result.totals,
   }]);
-  const empty = await read('/token-usage/daily', query({ period: '-10day' }));
+  const empty = await read('/token-usage/daily', query({ period: '-365d' }));
   assert.equal(empty.days.length, 1);
-  assert.equal(empty.days[0].date, '2025-12-24');
+  assert.equal(empty.days[0].date, '2025-01-03');
   assert.equal(empty.range.end_ms - empty.range.start_ms, DAY);
   assert.equal(empty.days[0].totals.request_count, 0);
   assert.deepEqual(empty.days[0].byModel, []);
@@ -197,7 +236,7 @@ test('daily returns one complete natural-day bucket, including an empty day befo
 test('configured timezones change the exact natural day read by all endpoints', async (t) => {
   const clock = Date.parse('2026-11-03T18:45:00Z');
   for (const usageTimezone of ['+08:00', 'Z', '-05:00', '+05:30']) {
-    const range = createRelativeDayRange('-2day', usageTimezone, clock);
+    const range = createRelativeDayRange('-34d', usageTimezone, clock);
     const { path } = await createUsageDb(t, [
       { created_at_ms: range.startMs - 1, total_tokens: 100 },
       { created_at_ms: range.startMs, total_tokens: 1 },
@@ -206,7 +245,7 @@ test('configured timezones change the exact natural day read by all endpoints', 
     ]);
     const read = createUsageRangeReader({ sqliteDbPath: path, usageTimezone }, { now: () => clock });
     for (const route of routes) {
-      const result = await read(route, query({ period: '-2day' }));
+      const result = await read(route, query({ period: '-34d' }));
       assert.equal(result.range.start_ms, range.startMs);
       assert.equal(result.range.end_ms, range.endMs);
       assert.equal(result.totals?.total_tokens ?? result.items.reduce((sum, item) => sum + item.total_tokens, 0), 3);

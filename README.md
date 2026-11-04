@@ -132,11 +132,13 @@ Invoke-RestMethod 'http://127.0.0.1:4142/healthz'
 
 通过代理打开 `http://127.0.0.1:4142/usage-viewer`，Session Breakdown 中已匹配的 Codex 会话显示标题，鼠标悬浮显示原始 ID。修改代理监听地址或端口后，使用对应的页面地址；页面默认数据 endpoint 也使用代理的配置地址，`?endpoint=` 仍可覆盖。
 
-使用 `http://127.0.0.1:4142/usage-viewer?period=-1day` 查看昨天，`period=-2day` 查看前天，最多支持 `period=-10day`。每个值只选中 **N 天前的一个自然日**，以 `usageTimezone` 的 00:00 为起点、次日 00:00 为终点，包含起点、不包含终点。例如当地今天为 2026-11-04 时，`-2day` 查询 2026-11-02 全天；`-1day` 的终点恰好是今天 00:00。
+使用 `http://127.0.0.1:4142/usage-viewer?period=-1d` 查看昨天，`period=-2day` 查看前天，`period=-34d` 查看 34 天前。不再限制为 1–10 天；每个值只选中 **N 天前的一个自然日**，以 `usageTimezone` 的 00:00 为起点、次日 00:00 为终点，包含起点、不包含终点。例如当地今天为 2026-11-04 时，`-34d` 查询 2026-10-01 全天；`-1day` 的终点恰好是今天 00:00。
 
-`GET /token-usage`、`/token-usage/daily`、`/token-usage/events`、`/token-usage/sessions` 均支持相同的 `period`。忽略大小写，允许数字与 `day` 之间有一个空格或下划线：`-1%20Day`、`-1+Day`、`-1_day` 均规范化为 `-1day`。只接受 1–10 的整数，不接受零、前导零、小数、缺少 `day` 或额外后缀；无效相对日返回 400，`-0day` 不代表今天。`today` 等原有周期保持上游行为。
+`GET /token-usage`、`/token-usage/daily`、`/token-usage/events`、`/token-usage/sessions` 均支持相同的 `period`。接受 `-Nd` 和 `-Nday`，忽略大小写，允许数字与后缀之间有一个空格或下划线：`-34%20D`、`-34+Day`、`-34_day` 均规范化为 `-34day`。N 必须为无前导零的正整数；`-0d`、`-0day`、`-01d`、小数、非数字、只写 `-1`、复数 `-1days` 和其他多余后缀均返回 400。`from` / `to` 参数仍返回 400。`today` 等原有周期保持上游行为。
 
-相对日查询复用 copilot-api v2.7.43 的 `token_usage_events` 表结构，以只读事务查询本地 SQLite；不会修改数据库。数据库不可读或结构不兼容时返回 501，不改查今天。响应保持 `period: "custom"`，`range` 提供毫秒和 UTC 起止时间，以及形如 `2026-11-02 (-2 Day)` 的 `display_label`。页面下拉框会增加当前相对日，选择与 URL 保持同步。覆盖 `endpoint` 时，相对日功能要求目标也支持这些周期。
+相对日的上限由 `usageTimezone` 下的当前自然日决定：目标日期必须为 **1970-01-01 或之后**（含当天），因此 N 最大为当地今天距 1970-01-01 的天数。按本地日期判断，正时区的 1970-01-01 起点可以落在 UTC 的 1969-12-31。`-99999999d` 等过大值、超出 JavaScript 安全整数范围的 N、无法表示的日期范围均返回 400，页面 URL 和四个接口使用相同的日期边界。有效目标日期早于数据库的数据起点时仍返回该完整自然日的空列表或零用量，不报日期错误。
+
+相对日查询复用 copilot-api v2.7.43 的 `token_usage_events` 表结构，以只读事务查询本地 SQLite；不会修改数据库。数据库不可读或结构不兼容时返回 501，不改查今天。响应保持 `period: "custom"`，`range` 提供毫秒和 UTC 起止时间，以及形如 `2026-10-01 (-34 Day)` 的 `display_label`。页面下拉框会增加当前相对日（如 `-34 Day`），标题使用服务端日期标签；选择与 URL 保持同步，刷新、切换 tab 和翻页保留规范化的 `period`。覆盖 `endpoint` 时，相对日功能要求目标也支持这些周期。
 
 标题来自 `session_index.jsonl`，按 `updated_at` 取每个 ID 的最新记录，索引的修改时间或大小变化后重新读取。文件缺失、读取失败、空标题或无法匹配时保留 ID；损坏记录跳过。subagent 线程不在该索引中，因此保留原始 ID，不读取 rollout 文件补全。
 

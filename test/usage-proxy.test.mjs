@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { once } from 'node:events';
+import { readFileSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -9,6 +10,7 @@ import { createProxyServer } from '../src/server.mjs';
 import { createUsageDb } from './helpers/usage-db.mjs';
 
 const routes = ['/token-usage', '/token-usage/daily', '/token-usage/events', '/token-usage/sessions'];
+const viewerHtml = readFileSync(new URL('./fixtures/usage-viewer.upstream.html', import.meta.url));
 
 async function serve(t, config) {
   const requests = [];
@@ -24,6 +26,11 @@ async function serve(t, config) {
   };
   const upstream = await listen(http.createServer((req, res) => {
     requests.push(req.url);
+    if (req.url.startsWith('/usage-viewer?')) {
+      res.writeHead(200, { 'content-type': 'text/html' });
+      res.end(viewerHtml);
+      return;
+    }
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ forwarded: req.url }));
   }));
@@ -37,11 +44,11 @@ async function missingDatabase(t) {
   return join(directory, 'missing.sqlite');
 }
 
-test('four HTTP usage endpoints select the same single natural day in each timezone', async (t) => {
+test('four HTTP usage endpoints select the same day beyond ten days ago in each timezone', async (t) => {
   t.mock.timers.enable({ apis: ['Date'], now: Date.parse('2026-11-04T12:00:00Z') });
   for (const [usageTimezone, startUtc] of [
-    ['+08:00', '2026-11-02T16:00:00Z'], ['Z', '2026-11-03T00:00:00Z'],
-    ['-05:00', '2026-11-03T05:00:00Z'], ['+05:30', '2026-11-02T18:30:00Z'],
+    ['+08:00', '2026-09-30T16:00:00Z'], ['Z', '2026-10-01T00:00:00Z'],
+    ['-05:00', '2026-10-01T05:00:00Z'], ['+05:30', '2026-09-30T18:30:00Z'],
   ]) {
     await t.test(usageTimezone, async (t) => {
       const start = Date.parse(startUtc);
@@ -55,14 +62,14 @@ test('four HTTP usage endpoints select the same single natural day in each timez
       const env = await serve(t, { sqliteDbPath: fixture.path, usageTimezone });
       let expectedRange;
       for (const route of routes) {
-        const response = await fetch(`${env.url}${route}?period=-1+Day`);
+        const response = await fetch(`${env.url}${route}?period=-34+d`);
         assert.equal(response.status, 200, route);
         assert.equal(response.headers.get('cache-control'), 'no-store');
         const body = await response.json();
         assert.equal(body.period, 'custom');
         assert.equal(body.range.start_ms, start);
         assert.equal(body.range.end_ms, end);
-        assert.equal(body.range.display_label, '2026-11-03 (-1 Day)');
+        assert.equal(body.range.display_label, '2026-10-01 (-34 Day)');
         if (expectedRange) assert.deepEqual(body.range, expectedRange);
         expectedRange = body.range;
         if (body.totals) {
@@ -74,7 +81,7 @@ test('four HTTP usage endpoints select the same single natural day in each timez
         }
         if (route.endsWith('/daily')) {
           assert.equal(body.days.length, 1);
-          assert.equal(body.days[0].date, '2026-11-03');
+          assert.equal(body.days[0].date, '2026-10-01');
           assert.equal(body.days[0].start_ms, start);
           assert.equal(body.days[0].end_ms, end);
           assert.deepEqual(body.days[0].totals, body.totals);
@@ -85,27 +92,44 @@ test('four HTTP usage endpoints select the same single natural day in each timez
   }
 });
 
-test('encoded relative periods and -10day are accepted through HTTP with the default timezone', async (t) => {
+test('relative-day aliases and arbitrary day counts agree across all four HTTP endpoints', async (t) => {
   t.mock.timers.enable({ apis: ['Date'], now: Date.parse('2026-11-04T00:00:00Z') });
   const fixture = await createUsageDb(t);
   const env = await serve(t, { sqliteDbPath: fixture.path });
-  for (const period of ['-1day', '-1DAY', '-1%20Day', '-1+Day', '-1_day', '-10day']) {
-    const response = await fetch(`${env.url}/token-usage?period=${period}`);
-    assert.equal(response.status, 200, period);
-    const body = await response.json();
-    const expected = period === '-10day' ? '2026-10-24T16:00:00.000Z' : '2026-11-02T16:00:00.000Z';
-    assert.equal(body.range.start_utc, expected);
-    assert.equal(body.totals.request_count, 0);
+  for (const [days, startUtc] of [
+    [1, '2026-11-02T16:00:00.000Z'], [10, '2026-10-24T16:00:00.000Z'],
+    [11, '2026-10-23T16:00:00.000Z'], [34, '2026-09-30T16:00:00.000Z'],
+    [365, '2025-11-03T16:00:00.000Z'],
+  ]) {
+    let expectedRange;
+    for (const suffix of ['d', 'D', 'day', 'DAY', '%20d', '+D', '_d', '%20Day', '+DAY', '_day']) {
+      const period = `-${days}${suffix}`;
+      for (const route of routes) {
+        const response = await fetch(`${env.url}${route}?period=${period}`);
+        assert.equal(response.status, 200, `${route}: ${period}`);
+        const body = await response.json();
+        assert.equal(body.range.start_utc, startUtc);
+        assert.equal(body.range.end_ms - body.range.start_ms, 86400000);
+        if (expectedRange) assert.deepEqual(body.range, expectedRange);
+        expectedRange = body.range;
+        if (body.totals) assert.equal(body.totals.request_count, 0);
+        else assert.deepEqual(body.items, []);
+      }
+    }
   }
   assert.equal(env.requests.length, 0);
 });
 
 test('invalid periods and explicit date parameters fail locally even without a database', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.parse('2026-11-04T00:00:00Z') });
   const env = await serve(t, { sqliteDbPath: await missingDatabase(t) });
   for (const route of [...routes, '/usage-viewer']) {
     for (const query of [
-      'period=-0day', 'period=-11day', 'period=-01day', 'period=-1', 'period=-1.5day',
-      'period=-xday', 'period=-1days', 'period=-1__day', 'period=-1++day',
+      'period=-0d', 'period=-0day', 'period=-01d', 'period=-01day', 'period=-1',
+      'period=-1.5d', 'period=-1.5day', 'period=-xd', 'period=-xday', 'period=-1days',
+      'period=-1dextra', 'period=-1__day', 'period=-1++day', 'period=-1%2Bd',
+      'period=-99999999d', 'period=-9007199254740991d', 'period=-9007199254740992day',
+      `period=-${'9'.repeat(400)}d`,
       'period=-1day&from=20261101000000', 'period=today&to=20261102000000',
       'from=', 'to=', 'period=today&period=-1day', 'period=-1day&period=today',
     ]) {
@@ -119,6 +143,54 @@ test('invalid periods and explicit date parameters fail locally even without a d
     }
   }
   assert.equal(env.requests.length, 0);
+});
+
+test('the 1970 local-date boundary applies to all endpoints and the viewer before retained data', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.parse('2026-11-04T18:45:00Z') });
+  const dataStart = Date.parse('2026-01-01T00:00:00Z');
+  for (const [usageTimezone, maxDays, startUtc] of [
+    ['+08:00', 20762, '1969-12-31T16:00:00.000Z'],
+    ['Z', 20761, '1970-01-01T00:00:00.000Z'],
+    ['-05:00', 20761, '1970-01-01T05:00:00.000Z'],
+    ['+05:30', 20762, '1969-12-31T18:30:00.000Z'],
+    ['+14:00', 20762, '1969-12-31T10:00:00.000Z'],
+    ['-14:00', 20761, '1970-01-01T14:00:00.000Z'],
+  ]) {
+    await t.test(usageTimezone, async (t) => {
+      const fixture = await createUsageDb(t, [{ created_at_ms: dataStart, input_tokens: 100 }]);
+      const env = await serve(t, { sqliteDbPath: fixture.path, usageTimezone });
+      for (const route of routes) {
+        const response = await fetch(`${env.url}${route}?period=-${maxDays}d`);
+        assert.equal(response.status, 200, route);
+        const body = await response.json();
+        assert.equal(body.range.start_utc, startUtc);
+        assert.equal(body.range.end_ms - body.range.start_ms, 86400000);
+        assert.equal(body.range.display_label, `1970-01-01 (-${maxDays} Day)`);
+        assert.equal(body.data_start_ms, dataStart);
+        if (body.totals) {
+          assert.equal(body.totals.request_count, 0);
+          assert.equal(body.totals.total_tokens, 0);
+          assert.deepEqual(body.byModel, []);
+        } else {
+          assert.deepEqual(body.items, []);
+          assert.equal(body.total, 0);
+        }
+        if (body.days) assert.deepEqual(body.days.map((day) => day.date), ['1970-01-01']);
+      }
+      const pagePath = `/usage-viewer?period=-${maxDays}d`;
+      const page = await fetch(`${env.url}${pagePath}`);
+      assert.equal(page.status, 200);
+      assert.match(await page.text(), /id="token-usage-period"/);
+      for (const route of [...routes, '/usage-viewer']) {
+        const response = await fetch(`${env.url}${route}?period=-${maxDays + 1}d`);
+        assert.equal(response.status, 400, route);
+        const body = await response.json();
+        assert.equal(body.error.type, 'invalid_request_error');
+        assert.match(body.error.message, /1970-01-01/);
+      }
+      assert.deepEqual(env.requests, [pagePath]);
+    });
+  }
 });
 
 test('relative usage returns 501 on all endpoints when SQLite is unavailable', async (t) => {
@@ -172,7 +244,7 @@ test('relative usage supports loopback CORS, including preflight and local error
   const unavailable = await serve(t, { sqliteDbPath: await missingDatabase(t) });
   const origin = 'http://localhost:43000';
   for (const route of routes) {
-    for (const [period, status] of [['-1day', 501], ['-11day', 400]]) {
+    for (const [period, status] of [['-34d', 501], ['-99999999d', 400]]) {
       const response = await fetch(`${unavailable.url}${route}?period=${period}`, { headers: { origin } });
       assert.equal(response.status, status);
       assert.equal(response.headers.get('access-control-allow-origin'), origin);

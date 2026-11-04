@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import { runInNewContext } from 'node:vm';
+import { parseRelativeDayPeriod, UsageRangeError } from '../src/usage-range.mjs';
 import { rewriteUsageViewer, UsageViewerError } from '../src/usage-viewer.mjs';
 
 const original = readFileSync(new URL('./fixtures/usage-viewer.upstream.html', import.meta.url));
@@ -150,8 +151,9 @@ async function dashboardPage(path, source = html) {
   const element = (id) => {
     const listeners = new Map();
     const node = {
-      id, value: '', innerHTML: '', style: {}, dataset: {},
+      id, value: '', innerHTML: '', style: {}, dataset: {}, attributes: {},
       classList: { toggle() {} },
+      setAttribute(name, value) { this.attributes[name] = value; },
       addEventListener(type, handler) {
         listeners.set(type, [...listeners.get(type) || [], handler]);
       },
@@ -165,6 +167,7 @@ async function dashboardPage(path, source = html) {
   for (const id of ['endpoint-form', 'endpoint-url', 'x-api-key', 'token-usage-period', 'content-area',
     'page-tabs', 'usage-tab', 'models-tab', 'token-usage-period-field', 'fetch-button']) element(id);
   elements.get('fetch-button').querySelector = () => ({ textContent: '' });
+  for (const tab of ['usage', 'models']) elements.get(`${tab}-tab`).dataset.tab = tab;
 
   const select = elements.get('token-usage-period');
   const selectHtml = source.match(/<select\s+id="token-usage-period"[\s\S]*?<\/select>/)?.[0];
@@ -212,8 +215,8 @@ async function dashboardPage(path, source = html) {
     fetch: async (input) => {
       const url = new URL(input, window.location);
       requests.push(url);
-      assert.ok(url.pathname === '/usage' || tokenUsagePaths.includes(url.pathname), url.href);
-      const payload = url.pathname === '/usage' ? { quota_snapshots: {} } : {
+      assert.ok(['/usage', '/models', ...tokenUsagePaths].includes(url.pathname), url.href);
+      const payload = url.pathname === '/usage' ? { quota_snapshots: {} } : url.pathname === '/models' ? { data: [] } : {
         range, totals: {}, byModel: [], days: [], items: [],
         page: Number(url.searchParams.get('page') || 1), total: 0, total_pages: 1,
       };
@@ -221,7 +224,6 @@ async function dashboardPage(path, source = html) {
     },
     console: { warn() {}, error() {} },
     buildRequestHeaders: () => ({}),
-    updateControls() {},
     migrateLegacyApiKey() {},
     syncEndpointCredential() {},
     readCollapsedSections: () => ({}),
@@ -232,6 +234,7 @@ async function dashboardPage(path, source = html) {
     handleContentAreaChange() {},
     handleModelsSearch() {},
     renderUsageQuotas: () => '',
+    renderModelsSection: () => '<p>Models</p>',
     renderDetailedData: () => '',
     renderCollapseToggle: () => '',
     renderCollapseBody: (_key, body) => body,
@@ -262,6 +265,15 @@ async function dashboardPage(path, source = html) {
     get state() { return sandbox.viewer.state; },
     get url() { return window.location; },
     get rendered() { return elements.get('content-area').innerHTML; },
+    get periodHidden() { return elements.get('token-usage-period-field').hidden; },
+    async selectTab(tab) {
+      elements.get('page-tabs').dispatch('click', { target: { closest(selector) {
+        assert.equal(selector, '[data-tab]');
+        return elements.get(`${tab}-tab`);
+      } } });
+      await settle();
+      assert.equal(elements.get(`${tab}-tab`).attributes['aria-selected'], 'true');
+    },
     async selectPeriod(period) {
       select.value = period;
       select.dispatch('change');
@@ -299,11 +311,12 @@ test('extracted upstream fixture reproduces fallback to Today before rewriting',
   assertTokenUsageRequests(view.requests, 'today');
 });
 
-test('all ten relative days and accepted spellings survive upstream initialization and fetch builders', async () => {
-  for (let day = 1; day <= 10; day++) {
-    for (const suffix of ['day', ' Day', '_DAY']) {
+test('arbitrary relative days and accepted spellings survive upstream initialization and fetch builders', async () => {
+  for (const day of [1, 2, 10, 11, 34, 365, 20000]) {
+    for (const suffix of ['d', 'D', ' d', '_D', 'day', ' Day', '_DAY']) {
       const period = `-${day}${suffix}`;
       const canonical = `-${day}day`;
+      assert.equal(parseRelativeDayPeriod(period), canonical, period);
       const view = await dashboardPage(`?period=${encodeURIComponent(period)}&endpoint=%2Fusage`);
       assert.equal(view.state.tokenUsagePeriod, canonical, period);
       assert.equal(view.select.value, canonical, period);
@@ -315,9 +328,9 @@ test('all ten relative days and accepted spellings survive upstream initializati
   }
 });
 
-test('plus decoding, select changes, form refresh, pagination and reload retain the canonical relative period', async () => {
-  const view = await dashboardPage('?period=-1+Day&endpoint=%2Fusage&other=keep#fragment');
-  assert.equal(view.url.searchParams.get('period'), '-1day');
+test('plus decoding, select changes, form refresh, tabs, pagination and reload retain an arbitrary relative period', async () => {
+  const view = await dashboardPage('?period=-34+D&endpoint=%2Fusage&other=keep#fragment');
+  assert.equal(view.url.searchParams.get('period'), '-34day');
   assert.equal(view.history.replaced.length, 1);
   assert.equal(view.history.pushed.length, 0);
 
@@ -329,29 +342,49 @@ test('plus decoding, select changes, form refresh, pagination and reload retain 
   assert.equal(view.requests.some((url) => url.pathname === '/usage'), false);
 
   view.requests.length = 0;
-  await view.selectPeriod('-1day');
-  assert.equal(view.select.value, '-1day');
-  assertTokenUsageRequests(view.requests, '-1day');
-  assert.equal(view.url.searchParams.get('period'), '-1day');
+  await view.selectPeriod('-34day');
+  assert.equal(view.select.value, '-34day');
+  assertTokenUsageRequests(view.requests, '-34day');
+  assert.equal(view.url.searchParams.get('period'), '-34day');
   assert.equal(view.url.searchParams.get('other'), 'keep');
   assert.equal(view.url.hash, '#fragment');
   assert.equal(view.history.pushed.length, 2);
 
   view.requests.length = 0;
   await view.submit();
-  assertTokenUsageRequests(view.requests, '-1day');
+  assertTokenUsageRequests(view.requests, '-34day');
   assert.equal(view.requests.filter((url) => url.pathname === '/usage').length, 1);
+
+  view.requests.length = 0;
+  await view.selectTab('models');
+  assert.equal(view.state.activeTab, 'models');
+  assert.equal(view.periodHidden, true);
+  assert.deepEqual(view.requests.map((url) => url.pathname), ['/models']);
+  assert.equal(view.state.tokenUsagePeriod, '-34day');
+  assert.equal(view.select.value, '-34day');
+  assert.equal(view.url.searchParams.get('period'), '-34day');
+  view.requests.length = 0;
+  await view.submit();
+  assert.deepEqual(view.requests.map((url) => url.pathname), ['/models']);
+  assert.equal(view.url.searchParams.get('period'), '-34day');
+  await view.selectTab('usage');
+  assert.equal(view.state.activeTab, 'usage');
+  assert.equal(view.periodHidden, false);
+  assert.equal(view.state.tokenUsagePeriod, '-34day');
+  assert.equal(view.select.value, '-34day');
+  assert.equal(view.url.searchParams.get('period'), '-34day');
+  assert.match(view.rendered, /server-resolved date/);
 
   view.requests.length = 0;
   await view.viewer.fetchTokenUsageEventsPage(2);
   await view.viewer.fetchTokenUsageSessionsPage(2);
-  assertTokenUsageRequests(view.requests, '-1day', ['/token-usage/events', '/token-usage/sessions']);
+  assertTokenUsageRequests(view.requests, '-34day', ['/token-usage/events', '/token-usage/sessions']);
   assert.deepEqual(view.requests.map((url) => url.searchParams.get('page')), ['2', '2']);
 
   const reloaded = await dashboardPage(view.url.href);
-  assert.equal(reloaded.state.tokenUsagePeriod, '-1day');
-  assert.equal(reloaded.select.value, '-1day');
-  assertTokenUsageRequests(reloaded.requests, '-1day');
+  assert.equal(reloaded.state.tokenUsagePeriod, '-34day');
+  assert.equal(reloaded.select.value, '-34day');
+  assertTokenUsageRequests(reloaded.requests, '-34day');
 });
 
 test('relative URLs without an endpoint retain the selected option until the user refreshes', async () => {
@@ -379,13 +412,16 @@ test('built-in periods and legacy aliases keep their upstream selection and requ
 });
 
 test('invalid relative selectors and duplicate periods show an error without fetching Today', async () => {
-  for (const period of ['-0day', '-11day', '-01day', '-1days', '-1  day', '-1__day', '-1-day',
-    ' -1day', '-1day ', '-1day\n', '-1\tday', '-100day', '-1day\0']) {
+  for (const period of ['-0d', '-0day', '-01d', '-01day', '-1days', '-1  day', '-1__day', '-1-day',
+    ' -1day', '-1day ', '-1day\n', '-1\tday', '-1day\0', '-1', '-1.5d', '-1.0day', '-xd',
+    '-1e2d', '-1dextra', '-9007199254740992d', `-${'9'.repeat(400)}day`]) {
+    assert.throws(() => parseRelativeDayPeriod(period), (error) =>
+      error instanceof UsageRangeError && error.status === 400, JSON.stringify(period));
     const view = await dashboardPage(`?period=${encodeURIComponent(period)}&endpoint=%2Fusage`);
     assert.equal(view.requests.length, 0, JSON.stringify(period));
-    assert.match(view.state.error, /Relative-day period must be -1day through -10day/);
+    assert.match(view.state.error, /Relative-day period must be -Nd or -Nday/);
     assert.match(view.rendered, /role="alert"/);
-    assert.match(view.rendered, /Relative-day period must be -1day through -10day/);
+    assert.match(view.rendered, /Relative-day period must be -Nd or -Nday/);
   }
   const duplicate = await dashboardPage('?period=-1Day&period=today&endpoint=%2Fusage');
   assert.equal(duplicate.requests.length, 0);
@@ -424,11 +460,11 @@ test('explicit dates in page and nested endpoint URLs are rejected visibly befor
 });
 
 test('range text uses the server display label and never labels a pending relative range Today', async () => {
-  const view = await dashboardPage('?period=-1day');
+  const view = await dashboardPage('?period=-34d');
   const { renderTokenUsageRangeText } = view.viewer;
-  assert.equal(renderTokenUsageRangeText('-1day', { start_ms: 0, end_ms: 1, display_label: '2026-11-03 (-1 Day)' }),
-    '2026-11-03 (-1 Day)');
-  assert.equal(renderTokenUsageRangeText('-1day', null), '-1day');
+  assert.equal(renderTokenUsageRangeText('-34day', { start_ms: 0, end_ms: 1, display_label: '2026-10-01 (-34 Day)' }),
+    '2026-10-01 (-34 Day)');
+  assert.equal(renderTokenUsageRangeText('-34day', null), '-34day');
   assert.equal(renderTokenUsageRangeText('this_week', null), 'This week');
 });
 

@@ -25,10 +25,10 @@ function invalid(message) {
 
 export function parseRelativeDayPeriod(value) {
   if (value === null || value === undefined) return null;
-  if (typeof value !== 'string') throw invalid('period must be a named period or -1day through -10day.');
-  const match = /^-([1-9]|10)[ _]?day$/i.exec(value);
-  if (match?.[0] === value) return `-${match[1]}day`;
-  if (/^\s*-/.test(value)) throw invalid('Relative-day period must be -1day through -10day, with one optional space or underscore before day.');
+  if (typeof value !== 'string') throw invalid('period must be a named period, -Nd or -Nday.');
+  const match = /^-([1-9]\d*)[ _]?(?:d|day)$/i.exec(value);
+  if (match?.[0] === value && Number.isSafeInteger(Number(match[1]))) return `-${match[1]}day`;
+  if (/^\s*-/.test(value)) throw invalid('Relative-day period must be -Nd or -Nday, with a positive safe integer, no leading zeros and one optional space or underscore before the suffix.');
   return null;
 }
 
@@ -44,13 +44,19 @@ function offsetMinutes(value) {
 
 export function createRelativeDayRange(period, timezone = '+08:00', now = Date.now()) {
   const canonical = parseRelativeDayPeriod(period);
-  if (canonical === null) throw invalid('A relative-day period between -1day and -10day is required.');
+  if (canonical === null) throw invalid('A relative-day period of -Nd or -Nday is required.');
   const offsetMs = offsetMinutes(timezone) * 60000;
   if (!Number.isFinite(now) || !Number.isFinite(new Date(now).getTime())) throw invalid('Current time is invalid.');
   const days = Number(canonical.slice(1, -3));
-  const startMs = Math.floor((now + offsetMs) / DAY_MS) * DAY_MS - offsetMs - days * DAY_MS;
+  const today = Math.floor((now + offsetMs) / DAY_MS);
+  if (days > today) throw invalid('Relative-day target date must be on or after 1970-01-01 in usageTimezone.');
+  const localStartMs = (today - days) * DAY_MS;
+  const startMs = localStartMs - offsetMs;
   const endMs = startMs + DAY_MS;
-  const date = new Date(startMs + offsetMs).toISOString().slice(0, 10);
+  if (![localStartMs, startMs, endMs].every((value) => Number.isFinite(new Date(value).getTime()))) {
+    throw invalid('Relative-day range is outside the supported date range.');
+  }
+  const date = new Date(localStartMs).toISOString().split('T')[0];
   return { startMs, endMs, date, displayLabel: `${date} (-${days} Day)` };
 }
 
@@ -63,7 +69,7 @@ export function createUsageRangeReader({ sqliteDbPath = null, usageTimezone = '+
   now = () => Date.now(), openDatabase = openUsageDatabase,
 } = {}) {
   return async (pathname, params) => {
-    if (params.has('from') || params.has('to')) throw invalid('from and to are not supported. Use period=-1day through period=-10day.');
+    if (params.has('from') || params.has('to')) throw invalid('from and to are not supported. Use period=-Nd or period=-Nday.');
     if (params.getAll('period').length > 1) throw invalid('period must be specified at most once.');
     const period = parseRelativeDayPeriod(params.get('period'));
     if (period === null) return null;

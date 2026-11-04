@@ -10,7 +10,7 @@ import { createPlaintextCollaboration, CollaborationError } from './collaboratio
 import { adaptSse, preflightSse, readJsonResponse, writeStream, ResponseStreamError, MAX_JSON_RESPONSE_BYTES } from './responses-stream.mjs';
 import { createSessionTitleReader } from './session-titles.mjs';
 import { rewriteUsageViewer, UsageViewerError } from './usage-viewer.mjs';
-import { createUsageRangeReader, parseRelativeDayPeriod, UsageRangeError } from './usage-range.mjs';
+import { createRelativeDayRange, createUsageRangeReader, parseRelativeDayPeriod, UsageRangeError } from './usage-range.mjs';
 
 const decompressors = { zstd: promisify(zstdDecompress), gzip: promisify(gunzip), deflate: promisify(inflate) };
 const transformedRoutes = new Set(['/responses', '/responses/compact', '/v1/responses', '/v1/responses/compact']);
@@ -226,13 +226,14 @@ export function createProxyServer({ config: overrides = {}, log = () => {}, mana
       if (usageRangeRoutes.has(route) || route === '/usage-viewer') {
         const params = new URL(req.url, 'http://localhost').searchParams;
         if (params.has('from') || params.has('to')) {
-          throw new UsageRangeError(400, 'invalid_request_error', 'Use period=-1day through -10day; explicit date boundaries are not supported.');
+          throw new UsageRangeError(400, 'invalid_request_error', 'Use period=-Nd or -Nday; explicit date boundaries are not supported.');
         }
         if (params.getAll('period').length > 1) {
           throw new UsageRangeError(400, 'invalid_request_error', 'Specify period only once.');
         }
         const relativePeriod = parseRelativeDayPeriod(params.get('period'));
         relativeUsageViewer = req.method === 'GET' && route === '/usage-viewer' && relativePeriod !== null;
+        if (relativeUsageViewer) createRelativeDayRange(relativePeriod, config.usageTimezone);
         if (req.method === 'OPTIONS' && usageRangeRoutes.has(route) && relativePeriod !== null) {
           res.writeHead(204, {
             ...usageCorsHeaders(req.headers.origin), 'cache-control': 'no-store',
