@@ -148,15 +148,17 @@ Invoke-RestMethod 'http://127.0.0.1:4142/healthz'
 
 选择非 Today 周期时，原有 Token Usage Over Time 下方依次增加独立的 Output speed (tokens/s) 和 Cost (USD) 面板。
 原生周期和代理 `-Nd` 均适用；`-Nd` 仍表示 N 天前的单个自然日，因此显示一个点。
-每个模型各有一条线，没有 All 汇总线；模型颜色由名称确定，图例完整保留并自动换行。
+每个模型各有一条线；Cost (USD) 还提供 Total 汇总曲线，颜色与 Token Usage Over Time 的 Total 相同。模型颜色由名称确定，图例完整保留并自动换行。
 速度直接取 daily 响应的 `days[].byModel[].output_tokens_per_second`，单位为 tokens/s。
 该值沿用上游的加权计算：`1000 × 有效输出 token 总数 / (duration_ms - first_token_ms) 总和`。
 缺失速度显示 `—` 并断线；真实的 0 保持为 0，单点也可见。
-两个新图的布局、绘图区尺寸、图下图例和日期数值栏与原图一致。各自的 Filters 仅包含 Metric 按钮：All 展示全部模型，点击模型仅显示对应曲线并调整纵轴；没有 Model 下拉框。
+两个新图的布局、绘图区尺寸、图下图例和日期数值栏与原图一致。各自的 Filters 仅包含 Metric 按钮：All 展示全部曲线，点击模型或 Cost 的 Total 仅显示对应曲线并调整纵轴；没有 Model 下拉框。
 悬停某天可查看当前可见模型的值，点击日期可更新虚线标记和图下数值栏。单位只写在标题中，图内数值不重复单位；纵轴从 0 开始，保留异常峰值。
 图表随周期和刷新更新，三个图的筛选和日期选择互不影响；筛选不新增请求，lifetime 保留全部日期和历史模型。
 刷新后保留有效选择；模型消失时回到 All，日期失效时选择最近有有效数值的一天，全部数值缺失时选择最后一天。
+相同端点、凭据和周期的刷新会保留并淡化已有趋势图；切换查询时清空旧数据，加载失败后隐藏旧曲线和数值。
 成本读取 `days[].byModel[].costs[]` 中的 USD 项，复用页面的 `getCostAmount`：优先 `amount`，否则 `total_cost_nanos / 1e9`。
+Total 使用每日 `days[].totals.costs[]` 中的 USD 汇总，同样保留缺失值和真实零值，不在页面重算模型费用之和。
 v2.7.43 daily 的模型和 totals 均已有 `costs[]`；它是事件中已记录费用按日期、模型、币种求和，并非按 token 重新估价。
 代理 `-Nd` 的只读 SQLite 查询已输出相同结构和单位，本次无需修改 SQL；测试核对 summary 与 daily 的费用一致性。
 只显示美元，不换汇、不混加其他币种；无 USD 记录时显示 `—` 并断线，已记录的零费用保持为 0。

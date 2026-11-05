@@ -17,9 +17,11 @@ function handleModelDailyTrendClick(event) {
   for (const key of ['output-speed', 'cost']) {
     const selection = modelDailyTrendState[key];
     const all = event.target.closest(`[data-${key}-all]`);
+    const total = event.target.closest(`[data-${key}-total]`);
     const metric = event.target.closest(`[data-${key}-metric]`);
     const day = event.target.closest(`[data-${key}-day]`);
     if (all) selection.metric = null;
+    else if (total) selection.metric = totalTrendMetric;
     else if (metric) selection.metric = metric.getAttribute(`data-${key}-metric`);
     else if (day) selection.day = day.getAttribute(`data-${key}-day`);
     else continue;
@@ -28,7 +30,7 @@ function handleModelDailyTrendClick(event) {
   }
 }
 
-function renderModelDailyTrend(dailySummary, error, { key, title, valueOf }) {
+function renderModelDailyTrend(dailySummary, error, { key, title, valueOf, includeTotal = false }) {
   if (state.tokenUsagePeriod === 'today') return '';
   const days = dailySummary?.days || [];
   const rows = days.map((day) => new Map((day.byModel || []).map((row) => [row.model, row])));
@@ -37,24 +39,30 @@ function renderModelDailyTrend(dailySummary, error, { key, title, valueOf }) {
     ...rows.flatMap((day) => [...day.keys()]),
   ])].filter((model) => typeof model === 'string').sort();
   const selection = modelDailyTrendState[key];
+  const readValue = (row) => {
+    const value = valueOf(row);
+    return typeof value === 'number' && Number.isFinite(value) ? value : null;
+  };
+  const series = models.map((model) => ({
+    id: model, label: model, color: modelTrendColor(model), values: rows.map((day) => readValue(day.get(model))),
+  }));
+  if (includeTotal) series.unshift({
+    id: totalTrendMetric, label: 'Total', color: 'var(--color-fg-lightest)',
+    values: days.map((day) => readValue(day.totals)),
+  });
   if (dailySummary && !error) {
-    if (!models.includes(selection.metric)) selection.metric = null;
+    if (!series.some(({ id }) => id === selection.metric)) selection.metric = null;
     if (!days.some((day) => day.date === selection.day)) selection.day = null;
   }
-  const series = models.map((model) => ({
-    model, color: modelTrendColor(model), values: rows.map((day) => {
-      const value = valueOf(day.get(model));
-      return typeof value === 'number' && Number.isFinite(value) ? value : null;
-    }),
-  }));
-  const visible = selection.metric === null ? series : series.filter(({ model }) => model === selection.metric);
-  const buttons = [{ model: null, color: 'var(--color-fg-lightest)' }, ...series].map(({ model, color }) => {
-    const active = selection.metric === model;
-    return `<button type="button" ${model === null ? `data-${key}-all` : `data-${key}-metric="${escapeHtml(model)}"`}
+  const visible = selection.metric === null ? series : series.filter(({ id }) => id === selection.metric);
+  const buttons = [{ id: null, label: 'All', color: 'var(--color-fg-lightest)' }, ...series].map(({ id, label, color }) => {
+    const active = selection.metric === id;
+    const attribute = id === null ? `data-${key}-all` : id === totalTrendMetric ? `data-${key}-total` : `data-${key}-metric="${escapeHtml(id)}"`;
+    return `<button type="button" ${attribute}
       aria-pressed="${active}" class="pill-button inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold max-w-full text-left"
       style="background-color: ${active ? 'rgba(37, 99, 235, 0.1)' : 'var(--color-bg)'}; border-color: ${active ? 'rgba(37, 99, 235, 0.28)' : 'var(--color-bg-light-2)'}; color: ${active ? 'var(--color-blue)' : 'var(--color-fg-medium)'};">
       <span class="h-2 w-2 rounded-full shrink-0" style="background-color: ${color};"></span>
-      <span style="overflow-wrap:anywhere;min-width:0">${escapeHtml(model === null ? 'All' : model)}</span>
+      <span style="overflow-wrap:anywhere;min-width:0">${escapeHtml(label)}</span>
     </button>`;
   }).join('');
 
@@ -62,7 +70,7 @@ function renderModelDailyTrend(dailySummary, error, { key, title, valueOf }) {
   if (error) body = `<div class="p-4">${renderError(error, 'Daily model trend failed')}</div>`;
   else if (state.isTokenUsageLoading && !dailySummary) {
     body = '<div class="p-4 min-h-[14rem] text-sm animate-pulse" style="color: var(--color-gray);">Loading...</div>';
-  } else if (!days.length || !models.length) {
+  } else if (!days.length || (!models.length && !series.some(({ values }) => values.some((value) => value !== null)))) {
     body = renderEmptyState('No daily model data for the selected period.');
   } else {
     body = renderModelDailyTrendChart(days, series, visible, selection.day, key);
@@ -114,7 +122,7 @@ function renderModelDailyTrendChart(days, series, visible, selectedDay, key) {
   const labelEvery = Math.max(1, Math.ceil(days.length / 6));
   const labels = days.map((day, index) => index % labelEvery && index !== days.length - 1 ? '' :
     `<text x="${x(index)}" y="${height - 10}" text-anchor="middle" font-size="11" fill="var(--color-gray-accent)">${escapeHtml(formatChartDate(day.date))}</text>`).join('');
-  const lines = visible.map(({ model, color, values }) => {
+  const lines = visible.map(({ id, color, values }) => {
     let connected = false;
     const path = values.map((value, index) => {
       if (value === null) { connected = false; return ''; }
@@ -124,7 +132,8 @@ function renderModelDailyTrendChart(days, series, visible, selectedDay, key) {
     }).join(' ');
     const dots = values.map((value, index) => value === null ? '' :
       `<circle cx="${x(index)}" cy="${y(value)}" r="2.5" fill="${color}" />`).join('');
-    return `<g data-${key}-model="${escapeHtml(model)}"><path d="${path}" fill="none" stroke="${color}" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.25" />${dots}</g>`;
+    const attribute = id === totalTrendMetric ? `data-${key}-total-series` : `data-${key}-model="${escapeHtml(id)}"`;
+    return `<g ${attribute}><path d="${path}" fill="none" stroke="${color}" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.25" />${dots}</g>`;
   }).join('');
   const marker = `<line data-${key}-active-day="${escapeHtml(activeDay.date)}" x1="${x(activeIndex)}" x2="${x(activeIndex)}"
     y1="${padding.top}" y2="${padding.top + plotHeight}" stroke="var(--color-bg-light-4)" stroke-dasharray="4 4" stroke-width="1" />`;
@@ -132,15 +141,15 @@ function renderModelDailyTrendChart(days, series, visible, selectedDay, key) {
   const hover = days.map((day, index) => {
     const start = Math.max(padding.left, x(index) - hitWidth / 2);
     const end = Math.min(width - padding.right, x(index) + hitWidth / 2);
-    const tooltip = [formatChartDate(day.date), ...visible.map(({ model, values }) =>
-      `${model}: ${formatModelTrendValue(values[index])}`)].join('\n');
+    const tooltip = [formatChartDate(day.date), ...visible.map(({ label, values }) =>
+      `${label}: ${formatModelTrendValue(values[index])}`)].join('\n');
     return `<rect data-${key}-day="${escapeHtml(day.date)}" x="${start}" y="${padding.top}" width="${end - start}" height="${plotHeight}" fill="transparent" style="cursor: pointer;"><title>${escapeHtml(tooltip)}</title></rect>`;
   }).join('');
-  const legend = series.map(({ model, color }) => `<span class="inline-flex items-center gap-1.5 text-xs font-medium max-w-full" style="color: var(--color-gray);">
+  const legend = series.map(({ label, color }) => `<span class="inline-flex items-center gap-1.5 text-xs font-medium max-w-full" style="color: var(--color-gray);">
     <span class="h-2 w-2 rounded-full shrink-0" style="background-color: ${color};"></span>
-    <span style="overflow-wrap:anywhere;min-width:0">${escapeHtml(model)}</span></span>`).join('');
-  const activeValues = visible.map(({ model, values }) =>
-    `<span style="overflow-wrap:anywhere;min-width:0">${escapeHtml(model)}: ${formatModelTrendValue(values[activeIndex])}</span>`).join('');
+    <span style="overflow-wrap:anywhere;min-width:0">${escapeHtml(label)}</span></span>`).join('');
+  const activeValues = visible.map(({ label, values }) =>
+    `<span style="overflow-wrap:anywhere;min-width:0">${escapeHtml(label)}: ${formatModelTrendValue(values[activeIndex])}</span>`).join('');
   return `<div class="p-4 ${state.isTokenUsageLoading ? 'opacity-60' : ''}">
     <svg data-${key}-chart class="w-full h-56" viewBox="0 0 ${width} ${height}" role="img" aria-labelledby="${key}-title">
       ${grid}${labels}${marker}${lines}${hover}
@@ -161,12 +170,13 @@ function renderOutputSpeedTrend(dailySummary, error) {
 
 function renderCostTrend(dailySummary, error) {
   return renderModelDailyTrend(dailySummary, error, {
-    key: 'cost', title: 'Cost (USD)',
+    key: 'cost', title: 'Cost (USD)', includeTotal: true,
     valueOf: (row) => getCostAmount(row?.costs?.find((cost) => cost.currency === 'USD')),
   });
 }
 
-export const usageTrendScript = `const modelDailyTrendState = {
+export const usageTrendScript = `const totalTrendMetric = Symbol('total');
+const modelDailyTrendState = {
   'output-speed': { metric: null, day: null }, cost: { metric: null, day: null },
 };\n` + [formatModelTrendValue, modelTrendColor, handleModelDailyTrendClick, renderModelDailyTrend,
   renderModelDailyTrendChart, renderOutputSpeedTrend, renderCostTrend].map(String).join('\n');

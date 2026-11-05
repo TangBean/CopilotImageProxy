@@ -17,7 +17,7 @@ test('cost uses upstream amount precedence and nanos fallback without converting
     missing: [],
     invalid: [usd(NaN)],
   })));
-  assert.deepEqual(tooltips(html), ['11/03\namount: 0.125\neur: —\ninvalid: —\nmissing: —\nmixed: 0.25\nnano: 0.000000001\nzero: 0']);
+  assert.deepEqual(tooltips(html), ['11/03\nTotal: —\namount: 0.125\neur: —\ninvalid: —\nmissing: —\nmixed: 0.25\nnano: 0.000000001\nzero: 0']);
   assert.equal(count(html, '<circle '), 4);
   assert.doesNotMatch(html, /data-cost-model="All"|NaN|Infinity/);
   assert.doesNotMatch(tooltips(html).join('\n'), /999/);
@@ -99,7 +99,7 @@ test('cost escapes model names in attributes, legends, buttons and tooltip text'
   const html = view.renderCostTrend(summary(day('2026-11-03', { [model]: [usd(0.5)] })));
   assert.doesNotMatch(html, /<img|<\/script>/);
   assert.equal(groups(html, 'cost')[0].model, view.escapeHtml(model));
-  assert.deepEqual(tooltips(html), [view.escapeHtml(`11/03\n${model}: 0.5`)]);
+  assert.deepEqual(tooltips(html), [view.escapeHtml(`11/03\nTotal: —\n${model}: 0.5`)]);
   assert.ok(html.includes(`data-cost-metric="${view.escapeHtml(model)}"`));
 });
 
@@ -118,7 +118,68 @@ test('cost hides Today and handles empty data and errors without drawing stale v
 test('non-UTF-8 pages retain missing USD markers after script decoding', () => {
   const source = new TextDecoder('windows-1252').decode(Buffer.from(usageTrendScript, 'utf8'));
   const html = viewer('last_7_days', source).renderCostTrend(summary(day('2026-11-03', { alpha: [] })));
-  assert.deepEqual(tooltips(html), ['11/03\nalpha: —']);
+  assert.deepEqual(tooltips(html), ['11/03\nTotal: —\nalpha: —']);
   assert.match(html, /Cost \(USD\)/);
   assert.equal(count(html, 'USD'), 1);
+});
+
+test('Total uses daily USD totals, shares the original Total color and can be selected independently', () => {
+  const view = viewer();
+  const data = {
+    totals: { costs: [usd(999)] },
+    days: [
+      { ...day('2026-11-01', { alpha: [usd(2)] }), totals: { costs: [{ currency: 'USD', amount: 10, total_cost_nanos: 9000000000 }] } },
+      { ...day('2026-11-02', { alpha: [usd(3)] }), totals: { costs: [{ currency: 'USD', total_cost_nanos: 1 }] } },
+      { ...day('2026-11-03', { alpha: [usd(4)] }), totals: { costs: [{ currency: 'EUR', amount: 7 }] } },
+      { ...day('2026-11-04', { alpha: [usd(5)] }), totals: { costs: [usd(0)] } },
+      day('2026-11-05', { alpha: [usd(6)] }),
+    ],
+  };
+  const all = view.renderCostTrend(data);
+  assert.match(all, /data-cost-total\s+aria-pressed="false"/);
+  assert.match(all, /<g data-cost-total-series><path[^>]*stroke="var\(--color-fg-lightest\)"/);
+  assert.match(all, /data-cost-total[\s\S]*?background-color: var\(--color-fg-lightest\);/);
+  assert.match(all, /data-cost-legend[\s\S]*?>Total</);
+  assert.equal(groups(all, 'cost').length, 1);
+  assert.deepEqual(tooltips(all).map((text) => text.split('\n')[1]), [
+    'Total: 10', 'Total: 0.000000001', 'Total: —', 'Total: 0', 'Total: —',
+  ]);
+  view.click('cost', 'total');
+  const selected = view.renderCostTrend(data);
+  assert.match(selected, /data-cost-total\s+aria-pressed="true"/);
+  assert.equal(groups(selected, 'cost').length, 0);
+  assert.equal(count(selected, '<circle '), 3);
+  assert.match(activeValues(selected, 'cost'), /11\/04[\s\S]*Total: 0/);
+  assert.doesNotMatch(activeValues(selected, 'cost'), /alpha|USD/);
+  assert.deepEqual(tooltips(selected), [
+    '11/01\nTotal: 10', '11/02\nTotal: 0.000000001', '11/03\nTotal: —', '11/04\nTotal: 0', '11/05\nTotal: —',
+  ]);
+  const totalPath = selected.match(/data-cost-total-series><path d="([^"]*)"/)?.[1];
+  assert.equal(count(totalPath, 'M'), 2);
+  assert.equal(count(totalPath, 'L'), 1);
+  view.click('cost', 'all');
+  assert.equal(groups(view.renderCostTrend(data), 'cost').length, 1);
+  assert.doesNotMatch(view.renderOutputSpeedTrend(data), /data-output-speed-total/);
+});
+
+test('Total remains available without model rows and does not collide with a model named Total', () => {
+  const view = viewer();
+  const data = summary({ ...day('2026-11-03', { Total: [usd(3)] }), totals: { costs: [usd(5)] } });
+  view.renderCostTrend(data);
+  view.click('cost', 'metric', 'Total');
+  const model = view.renderCostTrend(data);
+  assert.match(model, /data-cost-model="Total"/);
+  assert.doesNotMatch(model, /data-cost-total-series/);
+  assert.deepEqual(tooltips(model), ['11/03\nTotal: 3']);
+  view.click('cost', 'total');
+  const total = view.renderCostTrend(data);
+  assert.doesNotMatch(total, /data-cost-model="Total"/);
+  assert.deepEqual(tooltips(total), ['11/03\nTotal: 5']);
+  for (const amount of [0, 1e-9, 8]) {
+    const onlyTotal = view.renderCostTrend(summary({ date: '2026-11-04', totals: { costs: [usd(amount)] } }));
+    assert.match(onlyTotal, /data-cost-total\s+aria-pressed="true"/);
+    assert.match(onlyTotal, /data-cost-chart/);
+    assert.equal(count(onlyTotal, '<circle '), 1);
+    assert.equal(groups(onlyTotal, 'cost').length, 0);
+  }
 });

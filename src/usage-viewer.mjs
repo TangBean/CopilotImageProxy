@@ -4,6 +4,9 @@ const defaultEndpoint = 'const DEFAULT_ENDPOINT = "http://localhost:4141/usage";
 
 const dailyTrendRendererMarker = 'function renderTokenUsageDailyTrend(dailySummary, error) {';
 const dailyTrendCallMarker = '${renderTokenUsageDailyTrend(\n                dailySummary,\n                state.tokenUsageDailyError\n              )}';
+const dailyTrendLoadingMarker = `const period = getSelectedPeriod();
+          state.isTokenUsageLoading = true;
+          state.tokenUsageDailySummary = null;`;
 
 const periodSelectMarker = `<select
                 id="token-usage-period"
@@ -164,6 +167,14 @@ export function rewriteUsageViewer(body, { host, port }) {
     ['trend empty state', 'function renderEmptyState(message) {', 'function renderEmptyState(message) {'],
     ['trend click binding', 'contentArea.addEventListener("click", handleContentAreaClick);',
       'contentArea.addEventListener("click", handleContentAreaClick);\n          contentArea.addEventListener("click", handleModelDailyTrendClick);'],
+    ['trend refresh display', 'if (state.isLoading) {', 'if (state.isLoading && !state.tokenUsageDailySummary) {'],
+    ['trend refresh data', dailyTrendLoadingMarker, `const period = getSelectedPeriod();
+          const dailyContext = JSON.stringify([endpoint, period, apiKeyInput.value.trim()]);
+          if (state.tokenUsageDailyContext !== dailyContext) {
+            state.tokenUsageDailySummary = null;
+          }
+          state.tokenUsageDailyContext = dailyContext;
+          state.isTokenUsageLoading = true;`],
     ['daily trend panels', dailyTrendCallMarker,
       dailyTrendCallMarker + '\n              ${renderOutputSpeedTrend(dailySummary, state.tokenUsageDailyError)}'
       + '\n              ${renderCostTrend(dailySummary, state.tokenUsageDailyError)}'],

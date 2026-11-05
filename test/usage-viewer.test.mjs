@@ -211,11 +211,13 @@ async function dashboardPage(path, source = html, initialDaily = null) {
   };
   const range = { start_ms: 1793635200000, end_ms: 1793721600000, display_label: 'server-resolved date' };
   let daily = initialDaily;
+  let dailyGate = null;
+  let dailyFailure = null;
   const emptyTotals = { costs: [], input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0,
     cache_creation_input_tokens: 0, request_count: 0, total_nano_aiu: null, total_tokens: 0 };
   let ready;
   const sandbox = {
-    URL, URLSearchParams, window, Element, HTMLSelectElement,
+    URL, URLSearchParams, Error, window, Element, HTMLSelectElement,
     document: {
       addEventListener(type, callback) {
         assert.equal(type, 'DOMContentLoaded');
@@ -234,6 +236,10 @@ async function dashboardPage(path, source = html, initialDaily = null) {
       const url = new URL(input, window.location);
       requests.push(url);
       assert.ok(['/usage', '/models', ...tokenUsagePaths].includes(url.pathname), url.href);
+      if (url.pathname === '/token-usage/daily') {
+        if (dailyGate) await dailyGate;
+        if (dailyFailure) throw new Error(dailyFailure);
+      }
       const empty = {
         range, totals: emptyTotals, byModel: [], days: [], items: [],
         page: Number(url.searchParams.get('page') || 1), total: 0, total_pages: 1,
@@ -264,7 +270,17 @@ async function dashboardPage(path, source = html, initialDaily = null) {
     get url() { return window.location; },
     get rendered() { return elements.get('content-area').innerHTML; },
     get periodHidden() { return elements.get('token-usage-period-field').hidden; },
-    setDaily(data) { daily = structuredClone(data); },
+    setDaily(data) { daily = structuredClone(data); dailyFailure = null; },
+    pauseDaily() {
+      let release;
+      dailyGate = new Promise((resolve) => { release = resolve; });
+      return async (error = null) => {
+        dailyFailure = error;
+        dailyGate = null;
+        release();
+        await settle();
+      };
+    },
     changeTrendModel(model) {
       const target = new HTMLSelectElement('', { 'data-token-usage-trend-model': '' });
       target.value = model;
@@ -281,6 +297,9 @@ async function dashboardPage(path, source = html, initialDaily = null) {
     clickModelMetric(model, chart = 'output-speed') {
       const target = new Element('', model === null ? { [`data-${chart}-all`]: '' } : { [`data-${chart}-metric`]: model });
       elements.get('content-area').dispatch('click', { target });
+    },
+    clickCostTotal() {
+      elements.get('content-area').dispatch('click', { target: new Element('', { 'data-cost-total': '' }) });
     },
     async selectTab(tab) {
       elements.get('page-tabs').dispatch('click', { target: { closest(selector) {
@@ -299,6 +318,7 @@ async function dashboardPage(path, source = html, initialDaily = null) {
       elements.get('endpoint-url').value = endpoint;
       elements.get('endpoint-url').dispatch('change');
     },
+    setCredential(value) { elements.get('x-api-key').value = value; },
     async submit() {
       elements.get('endpoint-form').dispatch('submit', { preventDefault() {} });
       await settle();
@@ -621,26 +641,72 @@ test('refresh preserves valid model and date choices and falls back when data re
   }
 });
 
-test('real page shows loading, refresh dimming and daily errors in both chart panels', async () => {
+test('Cost Total works through the real click handler and survives Refresh independently', async () => {
   const view = await dashboardPage('?period=last_7_days&endpoint=%2Fusage', html, dailyFixture);
-  view.state.isTokenUsageLoading = true;
-  view.viewer.render();
+  const speed = outputSpeedPanel(view.rendered);
+  const tokenMetric = view.state.tokenUsageTrendMetric;
+  view.requests.length = 0;
+  view.clickCostTotal();
+  view.clickNewChartDay('2026-11-01', 'cost');
+  const cost = costPanel(view.rendered);
+  assert.match(cost, /data-cost-total\s+aria-pressed="true"/);
+  assert.match(cost, /data-cost-total-series/);
+  assert.doesNotMatch(cost, /data-cost-model=/);
+  assert.match(cost, /data-cost-values[^>]*>[\s\S]*11\/01[\s\S]*Total: 0\.000000001/);
+  assert.equal(outputSpeedPanel(view.rendered), speed);
+  assert.equal(view.state.tokenUsageTrendMetric, tokenMetric);
+  assert.equal(view.requests.length, 0);
+  await view.submit();
+  assert.match(costPanel(view.rendered), /data-cost-total\s+aria-pressed="true"/);
+  assert.match(costPanel(view.rendered), /data-cost-active-day="2026-11-01"/);
+  view.clickModelMetric(null, 'cost');
+  assert.match(costPanel(view.rendered), /data-cost-total-series/);
+  assert.match(costPanel(view.rendered), /data-cost-model="model-alpha"/);
+});
+
+test('real Refresh dims previous chart data, then replaces it or hides it on failure', async () => {
+  const view = await dashboardPage('?period=last_7_days&endpoint=%2Fusage', html, dailyFixture);
+  const release = view.pauseDaily();
+  await view.submit();
+  assert.equal(view.state.isLoading, true);
   for (const panel of [outputSpeedPanel(view.rendered), costPanel(view.rendered)]) {
     assert.match(panel, /opacity-60/);
+    assert.match(panel, /<svg/);
   }
-  view.state.tokenUsageDailySummary = null;
-  view.viewer.render();
-  for (const panel of [outputSpeedPanel(view.rendered), costPanel(view.rendered)]) {
-    assert.match(panel, /Loading\.\.\./);
-    assert.doesNotMatch(panel, /<svg/);
-  }
-  view.state.isTokenUsageLoading = false;
-  view.state.tokenUsageDailySummary = dailyFixture;
-  view.state.tokenUsageDailyError = '<daily failed>';
-  view.viewer.render();
+  const changed = structuredClone(dailyFixture);
+  changed.days[0].byModel[0].output_tokens_per_second = 9876.5;
+  view.setDaily(changed);
+  await release();
+  assert.match(outputSpeedPanel(view.rendered), /model-alpha: 9876.5/);
+  assert.doesNotMatch(outputSpeedPanel(view.rendered), /opacity-60/);
+  const fail = view.pauseDaily();
+  await view.submit();
+  await fail('<daily failed>');
   for (const panel of [outputSpeedPanel(view.rendered), costPanel(view.rendered)]) {
     assert.match(panel, /&lt;daily failed&gt;/);
     assert.doesNotMatch(panel, /<svg|<daily failed>/);
+  }
+});
+
+test('changing period, endpoint or credential clears prior chart data while requests are pending', async () => {
+  for (const change of ['period', 'endpoint', 'credential']) {
+    const view = await dashboardPage('?period=last_7_days&endpoint=%2Fusage', html, dailyFixture);
+    const release = view.pauseDaily();
+    if (change === 'period') await view.selectPeriod('lifetime');
+    else {
+      if (change === 'endpoint') view.setEndpoint('/usage?account=other');
+      else view.setCredential('test-account-two');
+      await view.submit();
+    }
+    assert.equal(view.state.isTokenUsageLoading, true);
+    assert.equal(view.state.tokenUsageDailySummary, null);
+    assert.doesNotMatch(view.rendered, /data-output-speed-chart|data-cost-chart/);
+    if (change === 'period') {
+      assert.match(outputSpeedPanel(view.rendered), /Loading\.\.\./);
+      assert.match(costPanel(view.rendered), /Loading\.\.\./);
+    }
+    await release();
+    assertTrendPanelOrder(view.rendered);
   }
 });
 
@@ -741,6 +807,8 @@ const requiredMarkers = [
   ['trend date formatter', 'function formatChartDate(value) {'],
   ['trend empty state', 'function renderEmptyState(message) {'],
   ['trend click binding', 'contentArea.addEventListener("click", handleContentAreaClick);'],
+  ['trend refresh display', 'if (state.isLoading) {'],
+  ['trend refresh data', 'const period = getSelectedPeriod();\n          state.isTokenUsageLoading = true;\n          state.tokenUsageDailySummary = null;'],
   ['closing body', '</body>'],
 ];
 
