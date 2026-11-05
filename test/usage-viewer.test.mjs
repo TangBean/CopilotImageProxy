@@ -6,6 +6,8 @@ import { parseRelativeDayPeriod, UsageRangeError } from '../src/usage-range.mjs'
 import { rewriteUsageViewer, UsageViewerError } from '../src/usage-viewer.mjs';
 
 const original = readFileSync(new URL('./fixtures/usage-viewer.upstream.html', import.meta.url));
+// Synthetic measurements in the daily response shape of copilot-api v2.7.43.
+const dailyFixture = JSON.parse(readFileSync(new URL('./fixtures/usage-daily.json', import.meta.url)));
 const viewerConfig = { host: '127.0.0.1', port: 43000 };
 const html = rewriteUsageViewer(original, viewerConfig).toString();
 const script = html.slice(html.lastIndexOf('<script>') + '<script>'.length, html.lastIndexOf('</script>'));
@@ -144,30 +146,36 @@ test('unavailable or unreadable title responses leave the dashboard usable', asy
 
 const tokenUsagePaths = ['/token-usage', '/token-usage/daily', '/token-usage/events', '/token-usage/sessions'];
 
-async function dashboardPage(path, source = html) {
+async function dashboardPage(path, source = html, initialDaily = null) {
   const requests = [];
   const history = { pushed: [], replaced: [] };
   const elements = new Map();
+  class Element {
+    constructor(id = '', attributes = {}) {
+      Object.assign(this, { id, value: '', innerHTML: '', style: {}, dataset: {}, attributes,
+        classList: { toggle() {} }, listeners: new Map() });
+    }
+    setAttribute(name, value) { this.attributes[name] = value; }
+    getAttribute(name) { return this.attributes[name] ?? null; }
+    matches(selector) { return Object.hasOwn(this.attributes, selector.slice(1, -1)); }
+    closest(selector) { return this.matches(selector) ? this : null; }
+    addEventListener(type, handler) {
+      this.listeners.set(type, [...this.listeners.get(type) || [], handler]);
+    }
+    dispatch(type, event = {}) {
+      for (const handler of this.listeners.get(type) || []) handler(event);
+    }
+  }
+  class HTMLSelectElement extends Element {}
   const element = (id) => {
-    const listeners = new Map();
-    const node = {
-      id, value: '', innerHTML: '', style: {}, dataset: {}, attributes: {},
-      classList: { toggle() {} },
-      setAttribute(name, value) { this.attributes[name] = value; },
-      addEventListener(type, handler) {
-        listeners.set(type, [...listeners.get(type) || [], handler]);
-      },
-      dispatch(type, event = {}) {
-        for (const handler of listeners.get(type) || []) handler(event);
-      },
-    };
+    const node = id === 'token-usage-period' ? new HTMLSelectElement(id) : new Element(id);
     elements.set(id, node);
     return node;
   };
   for (const id of ['endpoint-form', 'endpoint-url', 'x-api-key', 'token-usage-period', 'content-area',
-    'page-tabs', 'usage-tab', 'models-tab', 'token-usage-period-field', 'fetch-button']) element(id);
+    'page-tabs', 'usage-tab', 'subscriptions-tab', 'models-tab', 'token-usage-period-field', 'fetch-button']) element(id);
   elements.get('fetch-button').querySelector = () => ({ textContent: '' });
-  for (const tab of ['usage', 'models']) elements.get(`${tab}-tab`).dataset.tab = tab;
+  for (const tab of ['usage', 'subscriptions', 'models']) elements.get(`${tab}-tab`).dataset.tab = tab;
 
   const select = elements.get('token-usage-period');
   const selectHtml = source.match(/<select\s+id="token-usage-period"[\s\S]*?<\/select>/)?.[0];
@@ -181,8 +189,14 @@ async function dashboardPage(path, source = html) {
   });
   select.add = (option) => select.options.push(option);
 
+  const storage = new Map();
   const window = {
     location: new URL(path, 'http://127.0.0.1:43000/usage-viewer'),
+    localStorage: {
+      getItem: (key) => storage.get(key) ?? null,
+      setItem: (key, value) => storage.set(key, value),
+      removeItem: (key) => storage.delete(key),
+    },
     history: {
       replaceState(_data, _title, url) {
         window.location = new URL(url, window.location);
@@ -195,9 +209,12 @@ async function dashboardPage(path, source = html) {
     },
   };
   const range = { start_ms: 1793635200000, end_ms: 1793721600000, display_label: 'server-resolved date' };
+  let daily = initialDaily;
+  const emptyTotals = { costs: [], input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0,
+    cache_creation_input_tokens: 0, request_count: 0, total_nano_aiu: null, total_tokens: 0 };
   let ready;
   const sandbox = {
-    URL, URLSearchParams, window,
+    URL, URLSearchParams, window, Element, HTMLSelectElement,
     document: {
       addEventListener(type, callback) {
         assert.equal(type, 'DOMContentLoaded');
@@ -216,35 +233,15 @@ async function dashboardPage(path, source = html) {
       const url = new URL(input, window.location);
       requests.push(url);
       assert.ok(['/usage', '/models', ...tokenUsagePaths].includes(url.pathname), url.href);
-      const payload = url.pathname === '/usage' ? { quota_snapshots: {} } : url.pathname === '/models' ? { data: [] } : {
-        range, totals: {}, byModel: [], days: [], items: [],
+      const empty = {
+        range, totals: emptyTotals, byModel: [], days: [], items: [],
         page: Number(url.searchParams.get('page') || 1), total: 0, total_pages: 1,
       };
+      const payload = url.pathname === '/usage' ? { quota_snapshots: {} } : url.pathname === '/models' ? { data: [] }
+        : url.pathname === '/token-usage/daily' && daily ? daily : empty;
       return { ok: true, json: async () => payload };
     },
     console: { warn() {}, error() {} },
-    buildRequestHeaders: () => ({}),
-    migrateLegacyApiKey() {},
-    syncEndpointCredential() {},
-    readCollapsedSections: () => ({}),
-    storeApiKey() {},
-    handleTabsKeydown() {},
-    handleModelsConnectionChange() {},
-    handleContentAreaClick() {},
-    handleContentAreaChange() {},
-    handleModelsSearch() {},
-    renderUsageQuotas: () => '',
-    renderModelsSection: () => '<p>Models</p>',
-    renderDetailedData: () => '',
-    renderCollapseToggle: () => '',
-    renderCollapseBody: (_key, body) => body,
-    renderTokenUsageSection() {
-      const { state, escapeHtml, renderTokenUsageRangeText, renderError } = sandbox.viewer;
-      const activeRange = state.tokenUsageSummary?.range || state.tokenUsageDailySummary?.range;
-      const error = state.tokenUsageSummaryError || state.tokenUsageDailyError;
-      return `<p>${escapeHtml(renderTokenUsageRangeText(state.tokenUsagePeriod, activeRange))}</p>`
-        + (error ? renderError(error) : '');
-    },
   };
   const upstreamScript = source.match(/<script>([\s\S]*?)<\/script>/)?.[1];
   assert.ok(upstreamScript?.includes('        init();'), 'Fixture must execute the real upstream init');
@@ -253,7 +250,7 @@ async function dashboardPage(path, source = html) {
           state, normalizePeriod, getSelectedPeriod, syncUrlState, resolveUsageUrl, deriveEndpointUrl,
           buildTokenUsageSummaryUrl, buildTokenUsageDailyUrl, buildTokenUsageEventsUrl,
           fetchTokenUsageEventsPage, fetchTokenUsageSessionsPage,
-          renderTokenUsageRangeText, renderError, escapeHtml,
+          renderTokenUsageRangeText, renderError, escapeHtml, getCostAmount, render,
         };
         init();`);
   runInNewContext(instrumented, sandbox);
@@ -266,6 +263,20 @@ async function dashboardPage(path, source = html) {
     get url() { return window.location; },
     get rendered() { return elements.get('content-area').innerHTML; },
     get periodHidden() { return elements.get('token-usage-period-field').hidden; },
+    setDaily(data) { daily = structuredClone(data); },
+    changeTrendModel(model) {
+      const target = new HTMLSelectElement('', { 'data-token-usage-trend-model': '' });
+      target.value = model;
+      elements.get('content-area').dispatch('change', { target });
+    },
+    clickTrendMetric(metric) {
+      const target = new Element('', { 'data-trend-metric': metric });
+      elements.get('content-area').dispatch('click', { target });
+    },
+    clickNewChartDay(date) {
+      const target = new Element('', { 'data-output-speed-day': date });
+      elements.get('content-area').dispatch('click', { target });
+    },
     async selectTab(tab) {
       elements.get('page-tabs').dispatch('click', { target: { closest(selector) {
         assert.equal(selector, '[data-tab]');
@@ -353,7 +364,8 @@ test('plus decoding, select changes, form refresh, tabs, pagination and reload r
   view.requests.length = 0;
   await view.submit();
   assertTokenUsageRequests(view.requests, '-34day');
-  assert.equal(view.requests.filter((url) => url.pathname === '/usage').length, 1);
+  assert.equal(view.requests.filter((url) => url.pathname === '/usage').length, 0,
+    'v2.7.43 loads account allowances separately in the Subscriptions tab');
 
   view.requests.length = 0;
   await view.selectTab('models');
@@ -395,7 +407,7 @@ test('relative URLs without an endpoint retain the selected option until the use
   assert.equal(view.requests.length, 0);
   await view.submit();
   assertTokenUsageRequests(view.requests, '-10day');
-  assert.equal(view.requests.find((url) => url.pathname === '/usage').href, 'http://127.0.0.1:43000/usage');
+  assert.equal(view.requests.find((url) => url.pathname === '/token-usage').origin, 'http://127.0.0.1:43000');
 });
 
 test('built-in periods and legacy aliases keep their upstream selection and request behavior', async () => {
@@ -468,6 +480,97 @@ test('range text uses the server display label and never labels a pending relati
   assert.equal(renderTokenUsageRangeText('this_week', null), 'This week');
 });
 
+function outputSpeedPanel(rendered) {
+  return rendered.match(/<section class="panel mt-3" data-output-speed-panel>[\s\S]*?<\/section>/)?.[0] ?? '';
+}
+
+function assertSpeedPanelOrder(rendered) {
+  assert.equal((rendered.match(/data-output-speed-panel/g) || []).length, 1);
+  assert.equal((rendered.match(/data-output-speed-chart/g) || []).length, 1);
+  const originalIndex = rendered.indexOf('Token Usage Over Time');
+  const speedIndex = rendered.indexOf('data-output-speed-panel');
+  const breakdownIndex = rendered.indexOf('Model Breakdown');
+  assert.ok(originalIndex >= 0 && speedIndex > originalIndex && speedIndex < breakdownIndex);
+  assert.doesNotMatch(outputSpeedPanel(rendered), /data-trend-day|data-trend-metric|data-token-usage-trend-model/);
+}
+
+test('real v2.7.43 render flow places one independent speed panel after the original for native and relative periods', async () => {
+  for (const period of ['this_week', 'last_7_days', 'this_month', 'last_30_days', 'lifetime', '-1d', '-34day']) {
+    const view = await dashboardPage(`?period=${period}&endpoint=%2Fusage`, html, dailyFixture);
+    assertSpeedPanelOrder(view.rendered);
+    const panel = outputSpeedPanel(view.rendered);
+    assert.match(panel, /data-output-speed-model="model-alpha"/);
+    assert.match(panel, /data-output-speed-model="model-beta"/);
+    assert.doesNotMatch(panel, /data-output-speed-model="(?:All|__all__)"/);
+    assert.match(panel, /model-alpha: — tokens\/s/);
+    assert.match(panel, /model-beta: 0 tokens\/s/);
+    assert.match(panel, /model-beta: 1000000 tokens\/s/);
+  }
+  const today = await dashboardPage('?period=today&endpoint=%2Fusage', html, dailyFixture);
+  assert.doesNotMatch(today.rendered, /Token Usage Over Time|data-output-speed-panel/);
+});
+
+test('actual upstream model and metric handlers re-render without filtering the speed panel', async () => {
+  const view = await dashboardPage('?period=last_7_days&endpoint=%2Fusage', html, dailyFixture);
+  const firstRender = view.rendered;
+  const panel = outputSpeedPanel(firstRender);
+  view.requests.length = 0;
+  view.changeTrendModel('model-beta');
+  assert.equal(view.state.tokenUsageTrendModel, 'model-beta');
+  assert.notEqual(view.rendered, firstRender, 'Original model selector must actually render');
+  assert.equal(outputSpeedPanel(view.rendered), panel);
+  assertSpeedPanelOrder(view.rendered);
+  const modelRender = view.rendered;
+  view.clickTrendMetric('input_tokens');
+  assert.equal(view.state.tokenUsageTrendMetric, 'input_tokens');
+  assert.notEqual(view.rendered, modelRender, 'Original metric buttons must actually render');
+  assert.equal(outputSpeedPanel(view.rendered), panel);
+  assertSpeedPanelOrder(view.rendered);
+  const selectedDay = view.state.tokenUsageTrendDay;
+  view.clickNewChartDay('2026-11-01');
+  assert.equal(view.state.tokenUsageTrendDay, selectedDay, 'Speed hover areas cannot invoke the original day selection');
+  assert.equal(view.requests.length, 0, 'Chart filters do not fetch or alter the shared period');
+});
+
+test('refresh replaces speed measurements and period changes remove and restore the whole panel', async () => {
+  const view = await dashboardPage('?period=-34day&endpoint=%2Fusage', html, dailyFixture);
+  const initialPanel = outputSpeedPanel(view.rendered);
+  const changed = structuredClone(dailyFixture);
+  changed.days[0].byModel[0].output_tokens_per_second = 9876.5;
+  view.setDaily(changed);
+  view.requests.length = 0;
+  await view.submit();
+  assertTokenUsageRequests(view.requests, '-34day');
+  assertSpeedPanelOrder(view.rendered);
+  assert.notEqual(outputSpeedPanel(view.rendered), initialPanel);
+  assert.match(outputSpeedPanel(view.rendered), /model-alpha: 9876.5 tokens\/s/);
+  await view.selectPeriod('today');
+  assert.doesNotMatch(view.rendered, /data-output-speed-panel/);
+  await view.selectPeriod('lifetime');
+  assertSpeedPanelOrder(view.rendered);
+  assert.match(outputSpeedPanel(view.rendered), /model-alpha: 9876.5 tokens\/s/);
+  await view.selectPeriod('-34day');
+  assertSpeedPanelOrder(view.rendered);
+});
+
+test('real page renders empty, single-day and null daily speed data without losing its other sections', async () => {
+  for (const daily of [
+    { ...dailyFixture, days: [], byModel: [] },
+    { ...dailyFixture, days: [dailyFixture.days[0]] },
+    { ...dailyFixture, days: [{ ...dailyFixture.days[1], byModel: [dailyFixture.days[1].byModel[0]] }] },
+  ]) {
+    const view = await dashboardPage('?period=-1day&endpoint=%2Fusage', html, daily);
+    assert.equal((view.rendered.match(/data-output-speed-panel/g) || []).length, 1);
+    assert.match(view.rendered, /Model Breakdown|Session Breakdown|Request Events/);
+    const panel = outputSpeedPanel(view.rendered);
+    if (!daily.days.length) assert.match(panel, /— No daily model data/);
+    else if (daily.days[0].byModel[0].output_tokens_per_second === null) {
+      assert.match(panel, /model-alpha: — tokens\/s/);
+      assert.doesNotMatch(panel, /<circle/);
+    } else assert.match(panel, /<circle/);
+  }
+});
+
 const originalText = original.toString();
 function upstreamFunction(name) {
   const start = originalText.indexOf(`function ${name}(`);
@@ -487,6 +590,8 @@ const requiredMarkers = [
   ['derived endpoint validation', upstreamFunction('deriveEndpointUrl')],
   ['period initialization', originalText.slice(initStart, originalText.indexOf(initEnd, initStart) + initEnd.length)],
   ['range label', 'const label = labels[period] || labels.today;'],
+  ['daily trend renderer', 'function renderTokenUsageDailyTrend(dailySummary, error) {'],
+  ['daily trend panels', '${renderTokenUsageDailyTrend(\n                dailySummary,\n                state.tokenUsageDailyError\n              )}'],
   ['closing body', '</body>'],
 ];
 
@@ -516,11 +621,15 @@ test('a renamed period select or binding is reported as incompatible', () => {
 
 test('CRLF upstream excerpts are supported and mixed-ending duplicate markers still fail', async () => {
   const rewritten = rewriteUsageViewer(Buffer.from(originalText.replaceAll('\n', '\r\n')), viewerConfig).toString();
-  const view = await dashboardPage('?period=-10+Day&endpoint=%2Fusage', rewritten);
+  const view = await dashboardPage('?period=-10+Day&endpoint=%2Fusage', rewritten, dailyFixture);
   assert.equal(view.select.value, '-10day');
   assertTokenUsageRequests(view.requests, '-10day');
-  const duplicate = originalText + upstreamFunction('normalizePeriod').replaceAll('\n', '\r\n');
-  assert.throws(() => rewriteUsageViewer(Buffer.from(duplicate), viewerConfig), /period normalization marker is duplicated/);
+  assertSpeedPanelOrder(view.rendered);
+  for (const [name, marker] of requiredMarkers.filter(([, marker]) => marker.includes('\n'))) {
+    const duplicate = originalText + marker.replaceAll('\n', '\r\n');
+    assert.throws(() => rewriteUsageViewer(Buffer.from(duplicate), viewerConfig), (error) =>
+      error instanceof UsageViewerError && error.message.includes(`${name} marker is duplicated`));
+  }
 });
 
 test('rewriting preserves arbitrary source bytes outside its ASCII edits', () => {
@@ -528,7 +637,7 @@ test('rewriting preserves arbitrary source bytes outside its ASCII edits', () =>
   const prefix = Buffer.from([0xff, 0x80]);
   const suffix = Buffer.from([0xfe, 0x81]);
   const placeholder = Buffer.from('SOURCE_BYTE_SENTINEL');
-  const control = Buffer.from(originalText.replace('会话统计', placeholder.toString()));
+  const control = Buffer.from(originalText.replace('Copilot API Dashboard', placeholder.toString()));
   const originalIndex = control.indexOf(placeholder);
   const source = Buffer.concat([prefix, control.subarray(0, originalIndex), sentinel,
     control.subarray(originalIndex + placeholder.length), suffix]);

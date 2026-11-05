@@ -144,6 +144,17 @@ Invoke-RestMethod 'http://127.0.0.1:4142/healthz'
 
 此功能仅用于 Web Dashboard，不影响桌面 Electron Dashboard。上游返回未压缩的 200 HTML 页面时，代理按唯一的上游代码标记改写周期校验、初始化和 URL 同步；标记缺失或重复会明确返回 502，避免把相对日静默显示为 Today。请求相对日页面时，上游若返回压缩内容或其他不兼容的成功响应，也返回 502；其他响应保持透传。本地相对日 API 支持来自 `localhost`、`127.0.0.1` 和 `[::1]` 的 HTTP(S) 跨来源访问及预检，便于切换本机页面地址或 endpoint。
 
+### 按模型查看每日趋势
+
+选择非 Today 周期时，原有 Token Usage Over Time 下方增加独立的 Output speed 面板。
+原生周期和代理 `-Nd` 均适用；`-Nd` 仍表示 N 天前的单个自然日，因此显示一个点。
+每个模型各有一条线，没有 All 汇总线；模型颜色由名称确定，图例完整保留并自动换行。
+速度直接取 daily 响应的 `days[].byModel[].output_tokens_per_second`，单位为 tokens/s。
+该值沿用上游的加权计算：`1000 × 有效输出 token 总数 / (duration_ms - first_token_ms) 总和`。
+缺失速度显示 `—` 并断线；真实的 0 保持为 0，单点也可见。
+悬停某天可在 SVG 提示中查看当天所有模型的值；纵轴从 0 开始，保留异常峰值。
+图表随周期和刷新更新，不受原图 Model、Metric 或日期选择影响；lifetime 不采样丢弃历史模型。
+
 ## Codex v2 明文协作兼容
 
 这是针对 Copilot 原生协作工具兼容问题的绕过，不是对上游加密算法或密钥的修复。明文表示仅涉及 Responses JSON 中的任务文本；远程连接仍沿用原有传输方式。默认关闭，只处理普通 HTTP Responses 路由，不改变 compact 路由，不恢复、省略或迁移未知旧密文。

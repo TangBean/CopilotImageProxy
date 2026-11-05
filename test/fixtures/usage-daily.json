@@ -1,0 +1,255 @@
+{
+  "period": "last_7_days",
+  "range": {
+    "start_ms": 1793491200000,
+    "end_ms": 1793750400000,
+    "start_utc": "2026-11-01T00:00:00.000Z",
+    "end_utc": "2026-11-04T00:00:00.000Z"
+  },
+  "data_start_ms": 1793491200000,
+  "byModel": [
+    {
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "costs": [
+        {
+          "amount": 2.500000001,
+          "currency": "USD",
+          "total_cost_nanos": 2500000001
+        }
+      ],
+      "input_tokens": 60,
+      "output_tokens": 190,
+      "request_count": 3,
+      "total_nano_aiu": null,
+      "total_tokens": 250,
+      "model": "model-alpha",
+      "average_first_token_ms": 100,
+      "output_tokens_per_second": 43.75
+    },
+    {
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "costs": [
+        {
+          "amount": 1,
+          "currency": "EUR",
+          "total_cost_nanos": 1000000000
+        },
+        {
+          "amount": 0.00004,
+          "currency": "USD",
+          "total_cost_nanos": 40000
+        }
+      ],
+      "input_tokens": 60,
+      "output_tokens": 1037,
+      "request_count": 3,
+      "total_nano_aiu": null,
+      "total_tokens": 1097,
+      "model": "model-beta",
+      "average_first_token_ms": 100,
+      "output_tokens_per_second": 518.2408795602199
+    }
+  ],
+  "totals": {
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "costs": [
+      {
+        "amount": 1,
+        "currency": "EUR",
+        "total_cost_nanos": 1000000000
+      },
+      {
+        "amount": 2.500040001,
+        "currency": "USD",
+        "total_cost_nanos": 2500040001
+      }
+    ],
+    "input_tokens": 120,
+    "output_tokens": 1227,
+    "request_count": 6,
+    "total_nano_aiu": null,
+    "total_tokens": 1347
+  },
+  "days": [
+    {
+      "date": "2026-11-01",
+      "start_ms": 1793491200000,
+      "end_ms": 1793577600000,
+      "byModel": [
+        {
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "costs": [
+            {
+              "amount": 1e-9,
+              "currency": "USD",
+              "total_cost_nanos": 1
+            }
+          ],
+          "input_tokens": 20,
+          "output_tokens": 25,
+          "request_count": 1,
+          "total_nano_aiu": null,
+          "total_tokens": 45,
+          "model": "model-alpha",
+          "average_first_token_ms": 100,
+          "output_tokens_per_second": 12.5
+        },
+        {
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "costs": [
+            {
+              "amount": 0,
+              "currency": "USD",
+              "total_cost_nanos": 0
+            }
+          ],
+          "input_tokens": 20,
+          "output_tokens": 0,
+          "request_count": 1,
+          "total_nano_aiu": null,
+          "total_tokens": 20,
+          "model": "model-beta",
+          "average_first_token_ms": 100,
+          "output_tokens_per_second": 0
+        }
+      ],
+      "totals": {
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "costs": [
+          {
+            "amount": 1e-9,
+            "currency": "USD",
+            "total_cost_nanos": 1
+          }
+        ],
+        "input_tokens": 40,
+        "output_tokens": 25,
+        "request_count": 2,
+        "total_nano_aiu": null,
+        "total_tokens": 65
+      }
+    },
+    {
+      "date": "2026-11-02",
+      "start_ms": 1793577600000,
+      "end_ms": 1793664000000,
+      "byModel": [
+        {
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "costs": [],
+          "input_tokens": 20,
+          "output_tokens": 15,
+          "request_count": 1,
+          "total_nano_aiu": null,
+          "total_tokens": 35,
+          "model": "model-alpha",
+          "average_first_token_ms": null,
+          "output_tokens_per_second": null
+        },
+        {
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "costs": [
+            {
+              "amount": 1,
+              "currency": "EUR",
+              "total_cost_nanos": 1000000000
+            }
+          ],
+          "input_tokens": 20,
+          "output_tokens": 1000,
+          "request_count": 1,
+          "total_nano_aiu": null,
+          "total_tokens": 1020,
+          "model": "model-beta",
+          "average_first_token_ms": 100,
+          "output_tokens_per_second": 1000000
+        }
+      ],
+      "totals": {
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "costs": [
+          {
+            "amount": 1,
+            "currency": "EUR",
+            "total_cost_nanos": 1000000000
+          }
+        ],
+        "input_tokens": 40,
+        "output_tokens": 1015,
+        "request_count": 2,
+        "total_nano_aiu": null,
+        "total_tokens": 1055
+      }
+    },
+    {
+      "date": "2026-11-03",
+      "start_ms": 1793664000000,
+      "end_ms": 1793750400000,
+      "byModel": [
+        {
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "costs": [
+            {
+              "amount": 2.5,
+              "currency": "USD",
+              "total_cost_nanos": 2500000000
+            }
+          ],
+          "input_tokens": 20,
+          "output_tokens": 150,
+          "request_count": 1,
+          "total_nano_aiu": null,
+          "total_tokens": 170,
+          "model": "model-alpha",
+          "average_first_token_ms": 100,
+          "output_tokens_per_second": 75
+        },
+        {
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "costs": [
+            {
+              "amount": 0.00004,
+              "currency": "USD",
+              "total_cost_nanos": 40000
+            }
+          ],
+          "input_tokens": 20,
+          "output_tokens": 37,
+          "request_count": 1,
+          "total_nano_aiu": null,
+          "total_tokens": 57,
+          "model": "model-beta",
+          "average_first_token_ms": 100,
+          "output_tokens_per_second": 18.5
+        }
+      ],
+      "totals": {
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "costs": [
+          {
+            "amount": 2.50004,
+            "currency": "USD",
+            "total_cost_nanos": 2500040000
+          }
+        ],
+        "input_tokens": 40,
+        "output_tokens": 187,
+        "request_count": 2,
+        "total_nano_aiu": null,
+        "total_tokens": 227
+      }
+    }
+  ]
+}

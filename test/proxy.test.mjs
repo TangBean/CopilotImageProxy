@@ -656,7 +656,8 @@ const viewerValidators = {
 };
 
 test('usage viewer preserves non-UTF-8 bytes outside its ASCII edits', { timeout: TEST_TIMEOUT }, async (t) => {
-  const bytes = Buffer.from(usageViewerHtml.replace('会话统计', 'caf\u00e9'), 'latin1');
+  assert.ok(usageViewerHtml.includes('<title>Copilot API Dashboard</title>'));
+  const bytes = Buffer.from(usageViewerHtml.replace('<title>Copilot API Dashboard</title>', '<title>caf\u00e9</title>'), 'latin1');
   const env = await setup(t, { config: { port: 18042 }, handle: (_req, res) => {
     res.writeHead(200, { 'content-type': 'text/html; charset=iso-8859-1', 'content-length': String(bytes.length) });
     res.end(bytes);
@@ -689,7 +690,7 @@ test('usage viewer rewrites the configured origin and injects a static script wi
     const originHost = host === '::1' ? '[::1]' : host;
     assert.equal(result.status, 200);
     assert.ok(html.includes(`const DEFAULT_ENDPOINT = "http://${originHost}:18042/usage";`));
-    assert.ok(!html.includes('http://localhost:4141/usage'));
+    assert.ok(!html.includes('const DEFAULT_ENDPOINT = "http://localhost:4141/usage";'));
     assert.ok(!html.includes('TITLE_MUST_NOT_BE_EMBEDDED'));
     assert.match(html, /fetch\(['"]\/__session-titles['"]\)/);
     assert.match(html, /MutationObserver/);
@@ -758,6 +759,10 @@ test('usage viewer reports incompatible HTML markers instead of returning an unp
     usageViewerHtml.replace('</body>', ''),
     usageViewerHtml.replace('function normalizePeriod(', 'function changedNormalizePeriod('),
     usageViewerHtml.replace('</body>', '</body></body>'),
+    usageViewerHtml.replace('function renderTokenUsageDailyTrend(', 'function changedDailyTrend('),
+    usageViewerHtml + '\nfunction renderTokenUsageDailyTrend(dailySummary, error) {',
+    usageViewerHtml.replace('${renderTokenUsageDailyTrend(', '${changedDailyTrend('),
+    usageViewerHtml + '\n${renderTokenUsageDailyTrend(\n                dailySummary,\n                state.tokenUsageDailyError\n              )}',
   ];
   for (const body of cases) {
     const env = await setup(t, { handle: (_req, res) => {

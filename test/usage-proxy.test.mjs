@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { once } from 'node:events';
 import { readFileSync } from 'node:fs';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { access, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -12,7 +12,7 @@ import { createUsageDb } from './helpers/usage-db.mjs';
 const routes = ['/token-usage', '/token-usage/daily', '/token-usage/events', '/token-usage/sessions'];
 const viewerHtml = readFileSync(new URL('./fixtures/usage-viewer.upstream.html', import.meta.url));
 
-async function serve(t, config) {
+async function serve(t, config, responseBody = (url) => JSON.stringify({ forwarded: url })) {
   const requests = [];
   const listen = async (server) => {
     server.listen(0, '127.0.0.1');
@@ -32,7 +32,7 @@ async function serve(t, config) {
       return;
     }
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ forwarded: req.url }));
+    res.end(responseBody(req.url));
   }));
   const proxy = createProxyServer({ config: { ...config, upstream }, useWorker: false });
   return { url: await listen(proxy), requests };
@@ -214,6 +214,42 @@ test('ordinary periods keep their complete upstream URLs without requiring SQLit
       assert.equal(env.requests.at(-1), path);
     }
   }
+});
+
+test('native daily responses preserve model speeds and costs byte for byte without a local database', async (t) => {
+  const sqliteDbPath = await missingDatabase(t);
+  const model = {
+    model: 'model-a', request_count: 2, input_tokens: 10, output_tokens: 40,
+    cache_read_input_tokens: 0, cache_creation_input_tokens: 0, total_tokens: 50,
+    total_nano_aiu: null, average_first_token_ms: 150,
+    output_tokens_per_second: 40 * 1000 / 3000,
+    costs: [{ amount: 0.000000001, currency: 'USD', total_cost_nanos: 1 }],
+  };
+  const unavailable = { ...model, model: 'model-b', output_tokens_per_second: null, costs: [] };
+  const totals = { ...model, request_count: 4, input_tokens: 20, output_tokens: 80, total_tokens: 100 };
+  delete totals.model;
+  delete totals.average_first_token_ms;
+  delete totals.output_tokens_per_second;
+  const data = {
+    range: { start_ms: 1793548800000, end_ms: 1793635200000 },
+    byModel: [model, unavailable], totals,
+    days: [{ date: '2026-11-02', start_ms: 1793548800000, end_ms: 1793635200000,
+      byModel: [model, unavailable], totals }],
+  };
+  const bodyFor = (path) => JSON.stringify({
+    ...data, period: new URL(path, 'http://localhost').searchParams.get('period'),
+  }, null, 2) + '\n';
+  const env = await serve(t, { sqliteDbPath }, bodyFor);
+  for (const period of ['today', 'this_week', 'last_7_days', 'this_month', 'last_30_days', 'lifetime']) {
+    const path = `/token-usage/daily?period=${period}&keep=unaltered`;
+    const response = await fetch(`${env.url}${path}`);
+    assert.equal(response.status, 200, period);
+    assert.equal(response.headers.get('content-type'), 'application/json');
+    assert.deepEqual(Buffer.from(await response.arrayBuffer()), Buffer.from(bodyFor(path)), period);
+    assert.equal(env.requests.at(-1), path);
+  }
+  assert.equal(env.requests.length, 6);
+  await assert.rejects(access(sqliteDbPath), { code: 'ENOENT' });
 });
 
 test('relative usage supports loopback CORS, including preflight and local errors', async (t) => {

@@ -1,4 +1,9 @@
+import { usageTrendScript } from './usage-trends.mjs';
+
 const defaultEndpoint = 'const DEFAULT_ENDPOINT = "http://localhost:4141/usage";';
+
+const dailyTrendRendererMarker = 'function renderTokenUsageDailyTrend(dailySummary, error) {';
+const dailyTrendCallMarker = '${renderTokenUsageDailyTrend(\n                dailySummary,\n                state.tokenUsageDailyError\n              )}';
 
 const periodSelectMarker = `<select
                 id="token-usage-period"
@@ -63,6 +68,7 @@ const relativePeriodInitialization = `const endpointFromUrl = urlParams.get("end
             resolveUsageUrl(initialEndpoint);
           } catch (error) {
             state.error = getErrorMessage(error);
+            state.tokenUsageSummaryError = state.error;
             render();
             return;
           }
@@ -151,6 +157,9 @@ export function rewriteUsageViewer(body, { host, port }) {
             return range.display_label;
           }
           const label = labels[period] || period;`],
+    ['daily trend renderer', dailyTrendRendererMarker, `${usageTrendScript}\n        ${dailyTrendRendererMarker}`],
+    ['daily trend panels', dailyTrendCallMarker,
+      dailyTrendCallMarker + '\n              ${renderOutputSpeedTrend(dailySummary, state.tokenUsageDailyError)}'],
     ['closing body', '</body>', `${sessionTitlesScript}</body>`],
   ].map(([name, marker, replacement]) => uniqueEdit(body, name, marker, replacement))
     .sort((left, right) => left.start - right.start);
