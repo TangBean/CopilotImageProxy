@@ -157,6 +157,7 @@ async function dashboardPage(path, source = html, initialDaily = null) {
     }
     setAttribute(name, value) { this.attributes[name] = value; }
     getAttribute(name) { return this.attributes[name] ?? null; }
+    hasAttribute(name) { return Object.hasOwn(this.attributes, name); }
     matches(selector) { return Object.hasOwn(this.attributes, selector.slice(1, -1)); }
     closest(selector) { return this.matches(selector) ? this : null; }
     addEventListener(type, handler) {
@@ -275,6 +276,10 @@ async function dashboardPage(path, source = html, initialDaily = null) {
     },
     clickNewChartDay(date, chart = 'output-speed') {
       const target = new Element('', { [`data-${chart}-day`]: date });
+      elements.get('content-area').dispatch('click', { target });
+    },
+    clickModelMetric(model, chart = 'output-speed') {
+      const target = new Element('', model === null ? { [`data-${chart}-all`]: '' } : { [`data-${chart}-metric`]: model });
       elements.get('content-area').dispatch('click', { target });
     },
     async selectTab(tab) {
@@ -481,11 +486,11 @@ test('range text uses the server display label and never labels a pending relati
 });
 
 function outputSpeedPanel(rendered) {
-  return rendered.match(/<section class="panel mt-3" data-output-speed-panel>[\s\S]*?<\/section>/)?.[0] ?? '';
+  return rendered.match(/<section\b[^>]*data-output-speed-panel[^>]*>[\s\S]*?<\/section>/)?.[0] ?? '';
 }
 
 function costPanel(rendered) {
-  return rendered.match(/<section class="panel mt-3" data-cost-panel>[\s\S]*?<\/section>/)?.[0] ?? '';
+  return rendered.match(/<section\b[^>]*data-cost-panel[^>]*>[\s\S]*?<\/section>/)?.[0] ?? '';
 }
 
 function assertTrendPanelOrder(rendered) {
@@ -500,6 +505,13 @@ function assertTrendPanelOrder(rendered) {
   assert.ok(originalIndex >= 0 && speedIndex > originalIndex && costIndex > speedIndex && costIndex < breakdownIndex);
   for (const panel of [outputSpeedPanel(rendered), costPanel(rendered)]) {
     assert.doesNotMatch(panel, /data-trend-day|data-trend-metric|data-token-usage-trend-model/);
+    assert.match(panel, /xl:grid-cols-\[minmax\(0,1fr\)_304px\]/);
+    assert.match(panel, /class="w-full h-56"/);
+    assert.match(panel, /viewBox="0 0 720 220"/);
+    assert.match(panel, /<aside class="panel(?: min-w-0)?">/);
+    assert.match(panel, />Filters</);
+    assert.match(panel, />Metric</);
+    assert.doesNotMatch(panel, /<select|>Model</);
   }
 }
 
@@ -511,19 +523,19 @@ test('real v2.7.43 render flow places independent speed and cost panels after th
     assert.match(panel, /data-output-speed-model="model-alpha"/);
     assert.match(panel, /data-output-speed-model="model-beta"/);
     assert.doesNotMatch(panel, /data-output-speed-model="(?:All|__all__)"/);
-    assert.match(panel, /model-alpha: — tokens\/s/);
-    assert.match(panel, /model-beta: 0 tokens\/s/);
-    assert.match(panel, /model-beta: 1000000 tokens\/s/);
+    assert.match(panel, /model-alpha: —/);
+    assert.match(panel, /model-beta: 0/);
+    assert.match(panel, /model-beta: 1000000/);
     const cost = costPanel(view.rendered);
     assert.match(cost, /Cost \(USD\)/);
     assert.match(cost, /data-cost-model="model-alpha"/);
     assert.match(cost, /data-cost-model="model-beta"/);
     assert.doesNotMatch(cost, /data-cost-model="(?:All|__all__)"/);
-    assert.match(cost, /model-alpha: 0\.000000001 USD/);
-    assert.match(cost, /model-alpha: — USD/);
-    assert.match(cost, /model-beta: 0 USD/);
-    assert.match(cost, /model-beta: — USD/, 'An EUR-only day cannot be interpreted as USD');
-    assert.match(cost, /model-beta: 0\.00004 USD/);
+    assert.match(cost, /model-alpha: 0\.000000001/);
+    assert.match(cost, /model-alpha: —/);
+    assert.match(cost, /model-beta: 0/);
+    assert.match(cost, /model-beta: —/, 'An EUR-only day cannot be interpreted as');
+    assert.match(cost, /model-beta: 0\.00004/);
     assert.doesNotMatch(cost, /EUR/);
   }
   const today = await dashboardPage('?period=today&endpoint=%2Fusage', html, dailyFixture);
@@ -557,6 +569,81 @@ test('actual upstream model and metric handlers re-render without filtering eith
   assert.equal(view.requests.length, 0, 'Chart filters do not fetch or alter the shared period');
 });
 
+test('model metric and day clicks update only their own chart without fetching', async () => {
+  const view = await dashboardPage('?period=last_7_days&endpoint=%2Fusage', html, dailyFixture);
+  const originalMetric = view.state.tokenUsageTrendMetric;
+  const originalDay = view.state.tokenUsageTrendDay;
+  const firstCost = costPanel(view.rendered);
+  view.requests.length = 0;
+  view.clickModelMetric('model-alpha');
+  assert.match(outputSpeedPanel(view.rendered), /data-output-speed-model="model-alpha"/);
+  assert.doesNotMatch(outputSpeedPanel(view.rendered), /data-output-speed-model="model-beta"/);
+  assert.equal(costPanel(view.rendered), firstCost);
+  view.clickNewChartDay('2026-11-01');
+  assert.match(outputSpeedPanel(view.rendered), /data-output-speed-values[^>]*>[\s\S]*?11\/01/);
+  const selectedSpeed = outputSpeedPanel(view.rendered);
+  view.clickModelMetric('model-beta', 'cost');
+  assert.match(costPanel(view.rendered), /data-cost-model="model-beta"/);
+  assert.doesNotMatch(costPanel(view.rendered), /data-cost-model="model-alpha"/);
+  view.clickNewChartDay('2026-11-02', 'cost');
+  assert.match(costPanel(view.rendered), /data-cost-values[^>]*>[\s\S]*?11\/02/);
+  assert.equal(outputSpeedPanel(view.rendered), selectedSpeed);
+  assert.equal(view.state.tokenUsageTrendMetric, originalMetric);
+  assert.equal(view.state.tokenUsageTrendDay, originalDay);
+  view.clickModelMetric(null);
+  assert.match(outputSpeedPanel(view.rendered), /data-output-speed-model="model-beta"/);
+  view.clickModelMetric(null, 'cost');
+  assert.match(costPanel(view.rendered), /data-cost-model="model-alpha"/);
+  assert.equal(view.requests.length, 0);
+});
+
+test('refresh preserves valid model and date choices and falls back when data removes them', async () => {
+  const view = await dashboardPage('?period=last_7_days&endpoint=%2Fusage', html, dailyFixture);
+  for (const key of ['output-speed', 'cost']) {
+    view.clickModelMetric('model-beta', key);
+    view.clickNewChartDay('2026-11-01', key);
+  }
+  await view.submit();
+  for (const [key, panel] of [['output-speed', outputSpeedPanel], ['cost', costPanel]]) {
+    assert.doesNotMatch(panel(view.rendered), new RegExp(`data-${key}-model="model-alpha"`));
+    assert.match(panel(view.rendered), new RegExp(`data-${key}-values[^>]*>[\\s\\S]*?11/01`));
+  }
+  const changed = structuredClone(dailyFixture);
+  changed.byModel = changed.byModel.filter((row) => row.model !== 'model-beta');
+  changed.days = changed.days.slice(1).map((day) => ({ ...day, byModel: day.byModel.filter((row) => row.model !== 'model-beta') }));
+  view.setDaily(changed);
+  await view.submit();
+  for (const [key, panel] of [['output-speed', outputSpeedPanel], ['cost', costPanel]]) {
+    const body = panel(view.rendered);
+    assert.match(body, new RegExp(`data-${key}-model="model-alpha"`));
+    assert.doesNotMatch(body, /model-beta/);
+    assert.doesNotMatch(body.match(new RegExp(`data-${key}-values[^>]*>([\\s\\S]*?)</div>`))?.[1] || '', /11\/01/);
+  }
+});
+
+test('real page shows loading, refresh dimming and daily errors in both chart panels', async () => {
+  const view = await dashboardPage('?period=last_7_days&endpoint=%2Fusage', html, dailyFixture);
+  view.state.isTokenUsageLoading = true;
+  view.viewer.render();
+  for (const panel of [outputSpeedPanel(view.rendered), costPanel(view.rendered)]) {
+    assert.match(panel, /opacity-60/);
+  }
+  view.state.tokenUsageDailySummary = null;
+  view.viewer.render();
+  for (const panel of [outputSpeedPanel(view.rendered), costPanel(view.rendered)]) {
+    assert.match(panel, /Loading\.\.\./);
+    assert.doesNotMatch(panel, /<svg/);
+  }
+  view.state.isTokenUsageLoading = false;
+  view.state.tokenUsageDailySummary = dailyFixture;
+  view.state.tokenUsageDailyError = '<daily failed>';
+  view.viewer.render();
+  for (const panel of [outputSpeedPanel(view.rendered), costPanel(view.rendered)]) {
+    assert.match(panel, /&lt;daily failed&gt;/);
+    assert.doesNotMatch(panel, /<svg|<daily failed>/);
+  }
+});
+
 test('refresh replaces speed and cost measurements and period changes remove and restore both panels', async () => {
   const view = await dashboardPage('?period=-34day&endpoint=%2Fusage', html, dailyFixture);
   const initialPanel = outputSpeedPanel(view.rendered);
@@ -571,14 +658,14 @@ test('refresh replaces speed and cost measurements and period changes remove and
   assertTrendPanelOrder(view.rendered);
   assert.notEqual(outputSpeedPanel(view.rendered), initialPanel);
   assert.notEqual(costPanel(view.rendered), initialCost);
-  assert.match(outputSpeedPanel(view.rendered), /model-alpha: 9876.5 tokens\/s/);
-  assert.match(costPanel(view.rendered), /model-alpha: 0\.123456 USD/);
+  assert.match(outputSpeedPanel(view.rendered), /model-alpha: 9876.5/);
+  assert.match(costPanel(view.rendered), /model-alpha: 0\.123456/);
   await view.selectPeriod('today');
   assert.doesNotMatch(view.rendered, /data-output-speed-panel|data-cost-panel/);
   await view.selectPeriod('lifetime');
   assertTrendPanelOrder(view.rendered);
-  assert.match(outputSpeedPanel(view.rendered), /model-alpha: 9876.5 tokens\/s/);
-  assert.match(costPanel(view.rendered), /model-alpha: 0\.123456 USD/);
+  assert.match(outputSpeedPanel(view.rendered), /model-alpha: 9876.5/);
+  assert.match(costPanel(view.rendered), /model-alpha: 0\.123456/);
   await view.selectPeriod('-34day');
   assertTrendPanelOrder(view.rendered);
 });
@@ -598,13 +685,13 @@ test('real page renders empty, single-day and null daily data without losing its
     const panel = outputSpeedPanel(view.rendered);
     const cost = costPanel(view.rendered);
     if (!daily.days.length) {
-      assert.match(panel, /— No daily model data/);
-      assert.match(cost, /— No daily model data/);
+      assert.match(panel, /No daily model data/);
+      assert.match(cost, /No daily model data/);
     }
     else if (daily.days[0].byModel[0].output_tokens_per_second === null) {
-      assert.match(panel, /model-alpha: — tokens\/s/);
+      assert.match(panel, /model-alpha: —/);
       assert.doesNotMatch(panel, /<circle/);
-      assert.match(cost, /model-alpha: — USD/);
+      assert.match(cost, /model-alpha: —/);
       assert.doesNotMatch(cost, /<circle/);
     } else {
       assert.match(panel, /<circle/);
@@ -650,6 +737,10 @@ const requiredMarkers = [
   ['daily trend renderer', 'function renderTokenUsageDailyTrend(dailySummary, error) {'],
   ['daily trend panels', '${renderTokenUsageDailyTrend(\n                dailySummary,\n                state.tokenUsageDailyError\n              )}'],
   ['cost amount reader', 'function getCostAmount(cost) {'],
+  ['trend range formatter', 'function renderTokenUsageRangeText(period, range) {'],
+  ['trend date formatter', 'function formatChartDate(value) {'],
+  ['trend empty state', 'function renderEmptyState(message) {'],
+  ['trend click binding', 'contentArea.addEventListener("click", handleContentAreaClick);'],
   ['closing body', '</body>'],
 ];
 

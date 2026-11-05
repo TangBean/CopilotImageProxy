@@ -159,6 +159,11 @@ export function rewriteUsageViewer(body, { host, port }) {
           const label = labels[period] || period;`],
     ['daily trend renderer', dailyTrendRendererMarker, `${usageTrendScript}\n        ${dailyTrendRendererMarker}`],
     ['cost amount reader', 'function getCostAmount(cost) {', 'function getCostAmount(cost) {'],
+    ['trend range formatter', 'function renderTokenUsageRangeText(period, range) {', 'function renderTokenUsageRangeText(period, range) {'],
+    ['trend date formatter', 'function formatChartDate(value) {', 'function formatChartDate(value) {'],
+    ['trend empty state', 'function renderEmptyState(message) {', 'function renderEmptyState(message) {'],
+    ['trend click binding', 'contentArea.addEventListener("click", handleContentAreaClick);',
+      'contentArea.addEventListener("click", handleContentAreaClick);\n          contentArea.addEventListener("click", handleModelDailyTrendClick);'],
     ['daily trend panels', dailyTrendCallMarker,
       dailyTrendCallMarker + '\n              ${renderOutputSpeedTrend(dailySummary, state.tokenUsageDailyError)}'
       + '\n              ${renderCostTrend(dailySummary, state.tokenUsageDailyError)}'],

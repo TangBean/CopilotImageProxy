@@ -1,35 +1,14 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
 import test from 'node:test';
-import { runInNewContext } from 'node:vm';
 import { usageTrendScript } from '../src/usage-trends.mjs';
+import { activeValues, count, groups, tooltips, viewer } from './helpers/usage-trends.mjs';
 
-const upstream = readFileSync(new URL('./fixtures/usage-viewer.upstream.html', import.meta.url), 'utf8');
-const start = upstream.indexOf('function getCostAmount(cost) {');
-assert.ok(start >= 0);
-const getter = upstream.slice(start, upstream.indexOf('\n        }', start) + '\n        }'.length);
-const escapeHtml = (value) => String(value).replace(/[&<>"']/g, (char) => ({
-  '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-})[char]);
-
-function viewer(period = 'last_7_days', source = usageTrendScript) {
-  const context = {
-    state: { tokenUsagePeriod: period }, escapeHtml,
-    renderError: (message, title) => `<p role="alert">${escapeHtml(title)}: ${escapeHtml(message)}</p>`,
-  };
-  runInNewContext(`${getter}\n${source}`, context);
-  return context;
-}
 const usd = (amount) => ({ currency: 'USD', amount });
 const day = (date, costs) => ({ date, byModel: Object.entries(costs).map(([model, costs]) => ({ model, costs })) });
 const summary = (...days) => ({ days, byModel: [] });
-const titles = (html) => [...html.matchAll(/<title>([\s\S]*?)<\/title>/g)].map(([, text]) => text);
-const series = (html, key = 'cost') => [...html.matchAll(new RegExp(`<g data-${key}-model="([^"]*)">([\\s\\S]*?)<\\/g>`, 'g'))]
-  .map(([, model, body]) => ({ model, body, color: body.match(/stroke="([^"]*)"/)?.[1] }));
 
 test('cost uses upstream amount precedence and nanos fallback without converting other currencies', () => {
-  const view = viewer();
-  const html = view.renderCostTrend(summary(day('2026-11-03', {
+  const html = viewer().renderCostTrend(summary(day('2026-11-03', {
     amount: [{ currency: 'USD', amount: 0.125, total_cost_nanos: 9000000000 }],
     nano: [{ currency: 'USD', total_cost_nanos: 1 }],
     zero: [usd(0)],
@@ -38,13 +17,32 @@ test('cost uses upstream amount precedence and nanos fallback without converting
     missing: [],
     invalid: [usd(NaN)],
   })));
-  assert.deepEqual(titles(html), [
-    '2026-11-03\namount: 0.125 USD\neur: — USD\ninvalid: — USD\nmissing: — USD\nmixed: 0.25 USD\nnano: 0.000000001 USD\nzero: 0 USD',
-  ]);
-  assert.equal((html.match(/<circle /g) || []).length, 4);
-  assert.doesNotMatch(html, /data-cost-model="All"|>All<|NaN|Infinity/);
-  assert.doesNotMatch(titles(html).join('\n'), /999 USD/);
+  assert.deepEqual(tooltips(html), ['11/03\namount: 0.125\neur: —\ninvalid: —\nmissing: —\nmixed: 0.25\nnano: 0.000000001\nzero: 0']);
+  assert.equal(count(html, '<circle '), 4);
+  assert.doesNotMatch(html, /data-cost-model="All"|NaN|Infinity/);
+  assert.doesNotMatch(tooltips(html).join('\n'), /999/);
   assert.match(html, /<text[^>]*>0<\/text>/);
+});
+
+test('cost has title-only USD units and independent Metric filtering', () => {
+  const data = summary(day('2026-11-03', { alpha: [usd(0.1)], beta: [usd(20)] }));
+  data.days[0].byModel.forEach((row) => { row.output_tokens_per_second = 15; });
+  const view = viewer();
+  const cost = view.renderCostTrend(data);
+  const speed = view.renderOutputSpeedTrend(data);
+  assert.match(cost, /Cost \(USD\)/);
+  assert.equal(count(cost, 'USD'), 1);
+  assert.match(cost, /data-cost-all/);
+  assert.doesNotMatch(cost, /<select/);
+  view.click('cost', 'metric', 'alpha');
+  const selected = view.renderCostTrend(data);
+  assert.deepEqual(groups(selected, 'cost').map(({ model }) => model), ['alpha']);
+  assert.deepEqual(tooltips(selected), ['11/03\nalpha: 0.1']);
+  assert.match(activeValues(selected, 'cost'), /alpha: 0.1/);
+  assert.doesNotMatch(activeValues(selected, 'cost'), /beta|USD/);
+  assert.equal(view.renderOutputSpeedTrend(data), speed);
+  view.click('cost', 'all');
+  assert.deepEqual(groups(view.renderCostTrend(data), 'cost'), groups(cost, 'cost'));
 });
 
 test('unknown USD days break the line and explicit zero remains a measured dot', () => {
@@ -55,22 +53,24 @@ test('unknown USD days break the line and explicit zero remains a measured dot',
     day('2026-11-04', { alpha: [{ currency: 'EUR', amount: 4 }] }),
     day('2026-11-05', { alpha: [usd(2)] }),
   ));
-  const path = series(html)[0].body.match(/<path d="([^"]*)"/)[1];
-  assert.equal((path.match(/M/g) || []).length, 3);
-  assert.doesNotMatch(path, /L/);
-  assert.equal((html.match(/<circle /g) || []).length, 3);
-  assert.match(titles(html)[1], /alpha: — USD/);
-  assert.match(titles(html)[2], /alpha: 0 USD/);
-  assert.match(titles(html)[3], /alpha: — USD/);
+  const [line] = groups(html, 'cost');
+  assert.equal(count(line.path, 'M'), 3);
+  assert.doesNotMatch(line.path, /L/);
+  assert.equal(line.dots.length, 3);
+  assert.match(tooltips(html)[1], /alpha: —$/);
+  assert.match(tooltips(html)[2], /alpha: 0$/);
+  assert.match(tooltips(html)[3], /alpha: —$/);
 });
 
 test('tiny USD values and a single point remain visible without rounding to zero', () => {
   for (const amount of [0, 1e-9, 1e-12, 0.000000123456]) {
     const html = viewer('-34day').renderCostTrend(summary(day('2026-10-01', { alpha: [usd(amount)] })));
-    assert.equal((html.match(/<circle /g) || []).length, 1);
-    assert.match(html, /r="3"/);
-    if (amount > 0) assert.doesNotMatch(titles(html)[0], /alpha: 0 USD/);
-    assert.match(html, /aria-label="Cost \(USD\) by model in USD"/);
+    const [line] = groups(html, 'cost');
+    assert.equal(line.dots.length, 1);
+    assert.equal(line.dots[0].radius, 2.5);
+    if (amount > 0) assert.doesNotMatch(tooltips(html)[0], /alpha: 0$/);
+    assert.doesNotMatch(tooltips(html)[0], /USD/);
+    assert.match(html, /viewBox="0 0 720 220"/);
   }
 });
 
@@ -85,38 +85,40 @@ test('cost retains rare lifetime models and outliers and shares speed colors', (
   const view = viewer('lifetime');
   const cost = view.renderCostTrend(data);
   const speed = view.renderOutputSpeedTrend(data);
-  assert.equal(titles(cost).length, 366);
-  assert.match(titles(cost)[181], /rare: 1000000000000 USD/);
-  assert.match(cost, /1\.000e\+12/);
-  assert.equal((series(cost)[1].body.match(/<circle /g) || []).length, 1);
-  assert.deepEqual(series(cost).map(({ model, color }) => ({ model, color })),
-    series(speed, 'output-speed').map(({ model, color }) => ({ model, color })));
+  assert.equal(tooltips(cost).length, 366);
+  assert.match(tooltips(cost)[181], /rare: 1000000000000$/);
+  assert.match(cost, /1(?:\.0+)?e\+12/);
+  assert.equal(groups(cost, 'cost')[1].dots.length, 1);
+  assert.deepEqual(groups(cost, 'cost').map(({ model, color }) => ({ model, color })),
+    groups(speed).map(({ model, color }) => ({ model, color })));
 });
 
-test('cost escapes model names in attributes, legends and tooltip text', () => {
+test('cost escapes model names in attributes, legends, buttons and tooltip text', () => {
   const model = 'model"><img src=x onerror="alert(1)">&\' </script> 中文';
-  const html = viewer().renderCostTrend(summary(day('2026-11-03', { [model]: [usd(0.5)] })));
+  const view = viewer();
+  const html = view.renderCostTrend(summary(day('2026-11-03', { [model]: [usd(0.5)] })));
   assert.doesNotMatch(html, /<img|<\/script>/);
-  assert.equal(series(html)[0].model, escapeHtml(model));
-  assert.deepEqual(titles(html), [escapeHtml(`2026-11-03\n${model}: 0.5 USD`)]);
+  assert.equal(groups(html, 'cost')[0].model, view.escapeHtml(model));
+  assert.deepEqual(tooltips(html), [view.escapeHtml(`11/03\n${model}: 0.5`)]);
+  assert.ok(html.includes(`data-cost-metric="${view.escapeHtml(model)}"`));
 });
 
 test('cost hides Today and handles empty data and errors without drawing stale values', () => {
   const data = summary(day('2026-11-03', { alpha: [usd(123)] }));
   assert.equal(viewer('today').renderCostTrend(data), '');
   for (const empty of [null, summary(), summary(day('2026-11-03', {}))]) {
-    assert.match(viewer().renderCostTrend(empty), /— No daily model data/);
+    assert.match(viewer().renderCostTrend(empty), /No daily model data/);
   }
   const html = viewer().renderCostTrend(data, '<failed>');
-  assert.match(html, /Cost \(USD\) failed: &lt;failed&gt;/);
-  assert.doesNotMatch(html, /<circle|data-cost-chart/);
+  assert.match(html, /role="alert"/);
+  assert.match(html, /&lt;failed&gt;/);
+  assert.doesNotMatch(html, /<circle|data-cost-chart|data-cost-values/);
 });
 
-test('non-UTF-8 pages retain missing USD markers and caption characters after script decoding', () => {
+test('non-UTF-8 pages retain missing USD markers after script decoding', () => {
   const source = new TextDecoder('windows-1252').decode(Buffer.from(usageTrendScript, 'utf8'));
-  const view = viewer('last_7_days', source);
-  const html = view.renderCostTrend(summary(day('2026-11-03', { alpha: [] })));
-  assert.deepEqual(titles(html), ['2026-11-03\nalpha: — USD']);
-  assert.match(html, /USD · per model · daily/);
-  assert.match(view.renderCostTrend(summary()), /— No daily model data/);
+  const html = viewer('last_7_days', source).renderCostTrend(summary(day('2026-11-03', { alpha: [] })));
+  assert.deepEqual(tooltips(html), ['11/03\nalpha: —']);
+  assert.match(html, /Cost \(USD\)/);
+  assert.equal(count(html, 'USD'), 1);
 });
