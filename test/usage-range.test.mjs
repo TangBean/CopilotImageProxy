@@ -170,7 +170,8 @@ test('ordinary named periods return null without consulting the clock or opening
     openDatabase: () => { opens++; throw new Error('must not open'); },
   });
   for (const route of routes) {
-    for (const period of ['today', 'week', 'month', 'all']) {
+    for (const period of ['today', 'this_week', 'last_7_days', 'this_month', 'last_30_days', 'lifetime',
+      'week', 'month', 'all']) {
       assert.equal(await read(route, new URLSearchParams({ period })), null);
     }
     assert.equal(await read(route, new URLSearchParams()), null);
@@ -231,6 +232,60 @@ test('daily returns one complete natural-day bucket, including an empty day befo
   assert.equal(empty.totals.total_nano_aiu, null);
   assert.deepEqual(empty.totals.costs, []);
   assert.equal(empty.data_start_ms, start - 1);
+});
+
+test('daily and summary costs preserve nanos, zero, unknown prices and separate currencies in read-only queries', async (t) => {
+  const { path } = await createUsageDb(t, [
+    { created_at_ms: start - 1, model: 'outside', cost_currency: 'USD', total_cost_nanos: 9000000000 },
+    { created_at_ms: start, model: 'free', cost_currency: 'USD', total_cost_nanos: 0 },
+    { created_at_ms: start + 1, model: 'nano', cost_currency: 'USD', total_cost_nanos: 1 },
+    { created_at_ms: start + 2, model: 'paid', cost_currency: 'USD', total_cost_nanos: 1000000000 },
+    { created_at_ms: end - 1, model: 'paid', cost_currency: 'USD', total_cost_nanos: 2500000000 },
+    { created_at_ms: start + 3, model: 'paid', cost_currency: 'EUR', total_cost_nanos: 400000000 },
+    { created_at_ms: start + 4, model: 'eur-only', cost_currency: 'EUR', total_cost_nanos: 2000000000 },
+    { created_at_ms: start + 5, model: 'unknown', cost_currency: 'USD', total_cost_nanos: null },
+    { created_at_ms: start + 6, model: 'unknown', cost_currency: null, total_cost_nanos: 5000000000 },
+    { created_at_ms: start + 7, model: 'unknown', cost_currency: '', total_cost_nanos: 6000000000 },
+    { created_at_ms: end, model: 'outside', cost_currency: 'USD', total_cost_nanos: 9000000000 },
+  ]);
+  const before = await readFile(path);
+  const connections = [];
+  const read = createUsageRangeReader({ sqliteDbPath: path }, {
+    now: () => now,
+    openDatabase: (dbPath, options) => {
+      assert.equal(dbPath, path);
+      assert.deepEqual(options, { readOnly: true });
+      const connection = new DatabaseSync(dbPath, options);
+      connections.push(connection);
+      return connection;
+    },
+  });
+  const summary = await read('/token-usage', query());
+  const daily = await read('/token-usage/daily', query());
+  assert.equal(daily.days.length, 1);
+  assert.deepEqual(daily.byModel, summary.byModel);
+  assert.deepEqual(daily.totals, summary.totals);
+  assert.deepEqual(daily.days[0].byModel, summary.byModel);
+  assert.deepEqual(daily.days[0].totals, summary.totals);
+  assert.equal(daily.totals.request_count, 9);
+  assert.deepEqual(daily.totals.costs, [
+    { amount: 2.4, currency: 'EUR', total_cost_nanos: 2400000000 },
+    { amount: 3.500000001, currency: 'USD', total_cost_nanos: 3500000001 },
+  ]);
+  const byModel = Object.fromEntries(daily.days[0].byModel.map((row) => [row.model, row.costs]));
+  assert.deepEqual(byModel, {
+    'eur-only': [{ amount: 2, currency: 'EUR', total_cost_nanos: 2000000000 }],
+    free: [{ amount: 0, currency: 'USD', total_cost_nanos: 0 }],
+    nano: [{ amount: 1e-9, currency: 'USD', total_cost_nanos: 1 }],
+    paid: [
+      { amount: 0.4, currency: 'EUR', total_cost_nanos: 400000000 },
+      { amount: 3.5, currency: 'USD', total_cost_nanos: 3500000000 },
+    ],
+    unknown: [],
+  });
+  assert.equal(connections.length, 2);
+  assert.ok(connections.every((connection) => !connection.isOpen));
+  assert.deepEqual(await readFile(path), before);
 });
 
 test('configured timezones change the exact natural day read by all endpoints', async (t) => {

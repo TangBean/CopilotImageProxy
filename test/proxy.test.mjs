@@ -763,6 +763,8 @@ test('usage viewer reports incompatible HTML markers instead of returning an unp
     usageViewerHtml + '\nfunction renderTokenUsageDailyTrend(dailySummary, error) {',
     usageViewerHtml.replace('${renderTokenUsageDailyTrend(', '${changedDailyTrend('),
     usageViewerHtml + '\n${renderTokenUsageDailyTrend(\n                dailySummary,\n                state.tokenUsageDailyError\n              )}',
+    usageViewerHtml.replace('function getCostAmount(', 'function changedCostAmount('),
+    usageViewerHtml + '\nfunction getCostAmount(cost) {',
   ];
   for (const body of cases) {
     const env = await setup(t, { handle: (_req, res) => {

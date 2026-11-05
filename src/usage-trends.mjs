@@ -80,4 +80,11 @@ function renderOutputSpeedTrend(dailySummary, error) {
   });
 }
 
-export const usageTrendScript = [renderModelDailyTrend, renderOutputSpeedTrend].map(String).join('\n');
+function renderCostTrend(dailySummary, error) {
+  return renderModelDailyTrend(dailySummary, error, {
+    key: 'cost', title: 'Cost (USD)', unit: 'USD',
+    valueOf: (row) => getCostAmount(row?.costs?.find((cost) => cost.currency === 'USD')),
+  });
+}
+
+export const usageTrendScript = [renderModelDailyTrend, renderOutputSpeedTrend, renderCostTrend].map(String).join('\n');

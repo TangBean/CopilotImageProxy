@@ -146,7 +146,7 @@ Invoke-RestMethod 'http://127.0.0.1:4142/healthz'
 
 ### 按模型查看每日趋势
 
-选择非 Today 周期时，原有 Token Usage Over Time 下方增加独立的 Output speed 面板。
+选择非 Today 周期时，原有 Token Usage Over Time 下方依次增加独立的 Output speed 和 Cost (USD) 面板。
 原生周期和代理 `-Nd` 均适用；`-Nd` 仍表示 N 天前的单个自然日，因此显示一个点。
 每个模型各有一条线，没有 All 汇总线；模型颜色由名称确定，图例完整保留并自动换行。
 速度直接取 daily 响应的 `days[].byModel[].output_tokens_per_second`，单位为 tokens/s。
@@ -154,6 +154,12 @@ Invoke-RestMethod 'http://127.0.0.1:4142/healthz'
 缺失速度显示 `—` 并断线；真实的 0 保持为 0，单点也可见。
 悬停某天可在 SVG 提示中查看当天所有模型的值；纵轴从 0 开始，保留异常峰值。
 图表随周期和刷新更新，不受原图 Model、Metric 或日期选择影响；lifetime 不采样丢弃历史模型。
+成本读取 `days[].byModel[].costs[]` 中的 USD 项，复用页面的 `getCostAmount`：优先 `amount`，否则 `total_cost_nanos / 1e9`。
+v2.7.43 daily 的模型和 totals 均已有 `costs[]`；它是事件中已记录费用按日期、模型、币种求和，并非按 token 重新估价。
+代理 `-Nd` 的只读 SQLite 查询已输出相同结构和单位，本次无需修改 SQL；测试核对 summary 与 daily 的费用一致性。
+只显示美元，不换汇、不混加其他币种；无 USD 记录时显示 `—` 并断线，已记录的零费用保持为 0。
+两个面板对同一模型使用相同颜色；成本提示保留有效小数，1 nano USD 也不会显示成零。
+窄屏中图例自动换行，图形区域可横向滚动；大数和极小数的纵轴刻度使用科学计数法。
 
 ## Codex v2 明文协作兼容
 

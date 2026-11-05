@@ -158,8 +158,10 @@ export function rewriteUsageViewer(body, { host, port }) {
           }
           const label = labels[period] || period;`],
     ['daily trend renderer', dailyTrendRendererMarker, `${usageTrendScript}\n        ${dailyTrendRendererMarker}`],
+    ['cost amount reader', 'function getCostAmount(cost) {', 'function getCostAmount(cost) {'],
     ['daily trend panels', dailyTrendCallMarker,
-      dailyTrendCallMarker + '\n              ${renderOutputSpeedTrend(dailySummary, state.tokenUsageDailyError)}'],
+      dailyTrendCallMarker + '\n              ${renderOutputSpeedTrend(dailySummary, state.tokenUsageDailyError)}'
+      + '\n              ${renderCostTrend(dailySummary, state.tokenUsageDailyError)}'],
     ['closing body', '</body>', `${sessionTitlesScript}</body>`],
   ].map(([name, marker, replacement]) => uniqueEdit(body, name, marker, replacement))
     .sort((left, right) => left.start - right.start);
