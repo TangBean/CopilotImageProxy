@@ -2,6 +2,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 const DAY_MS = 86400000;
+const HOUR_MS = 3600000;
 const COST_NANOS_PER_UNIT = 1e9;
 const requiredColumns = [
   'id', 'created_at_ms', 'created_at_utc', 'trace_id', 'session_id', 'user_id', 'user_agent',
@@ -65,6 +66,31 @@ async function openUsageDatabase(path, options) {
   return new DatabaseSync(path, options);
 }
 
+async function readUsageDatabase(sqliteDbPath, openDatabase, read) {
+  let db;
+  try {
+    const dbPath = sqliteDbPath ?? process.env.COPILOT_API_SQLITE_DB_PATH ??
+      join(homedir(), '.local', 'share', 'copilot-api', 'copilot-api.sqlite');
+    db = await openDatabase(dbPath, { readOnly: true });
+    db.exec('PRAGMA busy_timeout = 1000');
+    db.exec('BEGIN');
+    const columns = new Set(db.prepare('PRAGMA table_info(token_usage_events)').all().map((row) => row.name));
+    if (requiredColumns.some((column) => !columns.has(column))) {
+      throw new UsageRangeError(501, 'usage_range_unavailable',
+        'Usage aggregation requires a compatible token_usage_events schema.');
+    }
+    const result = read(db);
+    db.exec('COMMIT');
+    return result;
+  } catch (error) {
+    if (error instanceof UsageRangeError) throw error;
+    throw new UsageRangeError(501, 'usage_range_unavailable',
+      'Cannot read the usage SQLite database. Check sqliteDbPath, database availability and schema.');
+  } finally {
+    db?.close();
+  }
+}
+
 export function createUsageRangeReader({ sqliteDbPath = null, usageTimezone = '+08:00' } = {}, {
   now = () => Date.now(), openDatabase = openUsageDatabase,
 } = {}) {
@@ -74,18 +100,7 @@ export function createUsageRangeReader({ sqliteDbPath = null, usageTimezone = '+
     const period = parseRelativeDayPeriod(params.get('period'));
     if (period === null) return null;
     const range = createRelativeDayRange(period, usageTimezone, now());
-    let db;
-    try {
-      const dbPath = sqliteDbPath ?? process.env.COPILOT_API_SQLITE_DB_PATH ??
-        join(homedir(), '.local', 'share', 'copilot-api', 'copilot-api.sqlite');
-      db = await openDatabase(dbPath, { readOnly: true });
-      db.exec('PRAGMA busy_timeout = 1000');
-      db.exec('BEGIN');
-      const columns = new Set(db.prepare('PRAGMA table_info(token_usage_events)').all().map((row) => row.name));
-      if (requiredColumns.some((column) => !columns.has(column))) {
-        throw new UsageRangeError(501, 'usage_range_unavailable',
-          'Relative-day usage requires a compatible token_usage_events schema.');
-      }
+    return readUsageDatabase(sqliteDbPath, openDatabase, (db) => {
       const dataStartMs = db.prepare('SELECT MIN(created_at_ms) AS start_ms FROM token_usage_events').get().start_ms;
       const base = { period: 'custom', range: rangePayload(range), data_start_ms: dataStartMs };
       let result;
@@ -103,15 +118,36 @@ export function createUsageRangeReader({ sqliteDbPath = null, usageTimezone = '+
           }];
         }
       }
-      db.exec('COMMIT');
       return result;
-    } catch (error) {
-      if (error instanceof UsageRangeError) throw error;
-      throw new UsageRangeError(501, 'usage_range_unavailable',
-        'Cannot read the usage SQLite database. Check sqliteDbPath, database availability and schema.');
-    } finally {
-      db?.close();
+    });
+  };
+}
+
+export function createUsageHourlyReader({ sqliteDbPath = null } = {}, { openDatabase = openUsageDatabase } = {}) {
+  return async (upstreamRange) => {
+    const range = { startMs: upstreamRange?.start_ms, endMs: upstreamRange?.end_ms };
+    if (![range.startMs, range.endMs].every((value) => Number.isSafeInteger(value) && Number.isFinite(new Date(value).getTime())) ||
+        range.endMs < range.startMs || range.endMs - range.startMs > DAY_MS) {
+      throw new UsageRangeError(502, 'usage_hourly_unavailable', 'Upstream Today usage did not provide a valid day range.');
     }
+    return readUsageDatabase(sqliteDbPath, openDatabase, (db) => {
+      const hours = Array.from({ length: 24 }, (_, index) => ({
+        hour: `${String(index).padStart(2, '0')}:00`,
+        start_ms: range.startMs + index * HOUR_MS,
+        end_ms: range.startMs + (index + 1) * HOUR_MS,
+        byModel: [],
+      }));
+      for (const row of getModelTimingRows(db, range, true)) {
+        hours[row.hour].byModel.push({
+          model: stringFromRow(row, 'model') || 'unknown',
+          output_tokens_per_second: nullableNumberFromRow(row, 'output_tokens_per_second'),
+        });
+      }
+      return {
+        period: 'today', range: rangePayload(range), hours,
+        byModel: getModelRows(db, range).map((row) => ({ model: stringFromRow(row, 'model') || 'unknown' })),
+      };
+    });
   };
 }
 
@@ -316,11 +352,12 @@ function getSessionSummaries(db, range, limit, offset) {
     return { ...totalsFromRow(row, costMap.get(session_id) ?? []), session_id };
   });
 }
-function getModelTimingRows(db, range) {
+function getModelTimingRows(db, range, hourly = false) {
+  const bucket = hourly ? `CAST((last_usage_at_ms - :start) / ${HOUR_MS} AS INTEGER)` : null;
   return db.prepare(`
     WITH selected_requests AS (
       SELECT DISTINCT request_id FROM token_usage_events
-      WHERE created_at_ms >= ? AND created_at_ms < ? AND request_id IS NOT NULL
+      WHERE created_at_ms >= :start AND created_at_ms < :end AND request_id IS NOT NULL
     ), requests AS (
       SELECT e.request_id, MIN(e.model) AS model,
         MIN(e.created_at_ms) AS first_usage_at_ms,
@@ -339,14 +376,15 @@ function getModelTimingRows(db, range) {
         AND MIN(e.first_token_ms) >= 0
         AND MIN(e.duration_ms) >= MAX(e.first_token_ms)
     )
-    SELECT model, AVG(first_token_ms) AS average_first_token_ms,
+    SELECT model, ${hourly ? `${bucket} AS hour,` : ''} AVG(first_token_ms) AS average_first_token_ms,
       1000.0 * SUM(CASE WHEN duration_ms > first_token_ms AND output_tokens > 0 THEN output_tokens END)
         / SUM(CASE WHEN duration_ms > first_token_ms AND output_tokens > 0 THEN duration_ms - first_token_ms END)
         AS output_tokens_per_second
     FROM requests
-    WHERE first_usage_at_ms >= ? AND last_usage_at_ms < ?
-    GROUP BY model
-  `).all(range.startMs, range.endMs, range.startMs, range.endMs);
+    WHERE first_usage_at_ms >= :start AND last_usage_at_ms < :end
+    GROUP BY model ${hourly ? `, ${bucket}` : ''}
+    ORDER BY model ${hourly ? ', hour' : ''}
+  `).all({ ':start': range.startMs, ':end': range.endMs });
 }
 function getModelSummaries(db, range) {
   const costMap = getModelCostMap(db, range);

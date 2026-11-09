@@ -7,6 +7,19 @@ const dailyTrendCallMarker = '${renderTokenUsageDailyTrend(\n                dai
 const dailyTrendLoadingMarker = `const period = getSelectedPeriod();
           state.isTokenUsageLoading = true;
           state.tokenUsageDailySummary = null;`;
+const usageFetchMarker = `const [summaryResult, dailyResult, eventsResult] =
+              await Promise.allSettled([
+                fetchJson(buildTokenUsageSummaryUrl(usageUrl, period)),
+                fetchJson(buildTokenUsageDailyUrl(usageUrl, period)),
+                fetchJson(buildTokenUsageEventsUrl(usageUrl, period, page)),
+              ]);`;
+const hourlyFetchScript = `let tokenUsageTrendRequestId = 0;
+        function fetchTokenUsageHourly(usageUrl, period) {
+          if (period !== "today") return Promise.resolve(null);
+          const url = new URL(deriveEndpointUrl(usageUrl, "token-usage/hourly"));
+          url.searchParams.set("period", period);
+          return fetchJson(url.toString());
+        }`;
 
 const periodSelectMarker = `<select
                 id="token-usage-period"
@@ -160,23 +173,47 @@ export function rewriteUsageViewer(body, { host, port }) {
             return range.display_label;
           }
           const label = labels[period] || period;`],
-    ['daily trend renderer', dailyTrendRendererMarker, `${usageTrendScript}\n        ${dailyTrendRendererMarker}`],
+    ['daily trend renderer', dailyTrendRendererMarker, `${hourlyFetchScript}\n        ${usageTrendScript}\n        ${dailyTrendRendererMarker}`],
     ['cost amount reader', 'function getCostAmount(cost) {', 'function getCostAmount(cost) {'],
     ['trend range formatter', 'function renderTokenUsageRangeText(period, range) {', 'function renderTokenUsageRangeText(period, range) {'],
     ['trend date formatter', 'function formatChartDate(value) {', 'function formatChartDate(value) {'],
     ['trend empty state', 'function renderEmptyState(message) {', 'function renderEmptyState(message) {'],
     ['trend click binding', 'contentArea.addEventListener("click", handleContentAreaClick);',
       'contentArea.addEventListener("click", handleContentAreaClick);\n          contentArea.addEventListener("click", handleModelDailyTrendClick);'],
-    ['trend refresh display', 'if (state.isLoading) {', 'if (state.isLoading && !state.tokenUsageDailySummary) {'],
+    ['trend refresh display', 'if (state.isLoading) {', 'if (state.isLoading && !state.tokenUsageDailySummary && !state.tokenUsageHourlySummary) {'],
+    ['hourly content visibility', 'const hasContent = Boolean(state.isTokenUsageLoading || state.isEventsLoading',
+      'const hasContent = Boolean(state.tokenUsageHourlySummary || state.tokenUsageHourlyError || state.isTokenUsageLoading || state.isEventsLoading'],
+    ['hourly section visibility', 'const hasTokenUsageContent = Boolean(',
+      'const hasTokenUsageContent = Boolean(state.tokenUsageHourlySummary || state.tokenUsageHourlyError ||'],
+    ['trend request identity', 'async function fetchTokenUsageSummaryAndEvents(page = 1) {',
+      'async function fetchTokenUsageSummaryAndEvents(page = 1) {\n          const requestId = ++tokenUsageTrendRequestId;'],
+    ['hourly invalid endpoint', 'if (!endpoint) {\n            state.tokenUsageDailySummary = null;',
+      'if (!endpoint) {\n            state.isTokenUsageLoading = false;\n            state.tokenUsageHourlySummary = null;\n            state.tokenUsageHourlyError = "Token usage requires a valid endpoint URL.";\n            state.tokenUsageDailySummary = null;'],
     ['trend refresh data', dailyTrendLoadingMarker, `const period = getSelectedPeriod();
           const dailyContext = JSON.stringify([endpoint, period, apiKeyInput.value.trim()]);
           if (state.tokenUsageDailyContext !== dailyContext) {
             state.tokenUsageDailySummary = null;
+            state.tokenUsageHourlySummary = null;
           }
           state.tokenUsageDailyContext = dailyContext;
+          state.tokenUsageHourlyError = null;
           state.isTokenUsageLoading = true;`],
+    ['hourly request', usageFetchMarker, `const [summaryResult, dailyResult, eventsResult, hourlyResult] =
+              await Promise.allSettled([
+                fetchJson(buildTokenUsageSummaryUrl(usageUrl, period)),
+                fetchJson(buildTokenUsageDailyUrl(usageUrl, period)),
+                fetchJson(buildTokenUsageEventsUrl(usageUrl, period, page)),
+                fetchTokenUsageHourly(usageUrl, period),
+              ]);
+            if (requestId !== tokenUsageTrendRequestId) return;
+            state.tokenUsageHourlySummary = hourlyResult.status === "fulfilled" ? hourlyResult.value : null;
+            state.tokenUsageHourlyError = hourlyResult.status === "rejected" ? getErrorMessage(hourlyResult.reason) : null;`],
+    ['hourly request error', 'console.error("Token usage fetch error:", error);',
+      'if (requestId !== tokenUsageTrendRequestId) return;\n            state.tokenUsageHourlySummary = null;\n            state.tokenUsageHourlyError = getErrorMessage(error);\n            console.error("Token usage fetch error:", error);'],
+    ['trend request completion', 'state.isTokenUsageLoading = false;\n            render("usage");',
+      'if (requestId === tokenUsageTrendRequestId) {\n              state.isTokenUsageLoading = false;\n              render("usage");\n            }'],
     ['daily trend panels', dailyTrendCallMarker,
-      dailyTrendCallMarker + '\n              ${renderOutputSpeedTrend(dailySummary, state.tokenUsageDailyError)}'
+      dailyTrendCallMarker + '\n              ${renderOutputSpeedTrend(state.tokenUsagePeriod === "today" ? state.tokenUsageHourlySummary : dailySummary, state.tokenUsagePeriod === "today" ? state.tokenUsageHourlyError : state.tokenUsageDailyError)}'
       + '\n              ${renderCostTrend(dailySummary, state.tokenUsageDailyError)}'],
     ['closing body', '</body>', `${sessionTitlesScript}</body>`],
   ].map(([name, marker, replacement]) => uniqueEdit(body, name, marker, replacement))

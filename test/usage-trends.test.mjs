@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { usageTrendScript } from '../src/usage-trends.mjs';
-import { activeValues, count, groups, tooltips, viewer } from './helpers/usage-trends.mjs';
+import { activeValues, count, groups, hourlySummary, tooltips, viewer } from './helpers/usage-trends.mjs';
 
 const day = (date, values) => ({
   date, byModel: Object.entries(values).map(([model, speed]) => ({ model, output_tokens_per_second: speed })),
@@ -10,9 +10,6 @@ const summary = (...days) => ({ days, byModel: [] });
 
 test('speed matches the original chart layout with Metric-only Filters and title-only units', () => {
   const data = summary(day('2026-11-03', { alpha: 14.5, beta: 22 }));
-  const today = viewer('today');
-  assert.equal(today.renderOutputSpeedTrend(data), '');
-  assert.equal(today.renderOutputSpeedTrend(data, 'Daily request failed'), '');
   for (const period of ['this_week', 'last_7_days', 'this_month', 'last_30_days', 'lifetime', '-1day', '-34day']) {
     const html = viewer(period).renderOutputSpeedTrend(data);
     assert.equal(count(html, 'data-output-speed-panel'), 1, period);
@@ -211,12 +208,67 @@ test('original chart filters do not change speed lines, tooltips or date selecti
   });
   assert.equal(view.renderOutputSpeedTrend(data), initial);
   view.state.tokenUsagePeriod = 'today';
-  assert.equal(view.renderOutputSpeedTrend(data), '');
+  assert.match(view.renderOutputSpeedTrend(data), /No hourly model data/);
   view.state.tokenUsagePeriod = '-34day';
   const relative = view.renderOutputSpeedTrend(data);
   assert.deepEqual(groups(relative), groups(initial));
   assert.deepEqual(tooltips(relative), tooltips(initial));
   assert.equal(activeValues(relative), activeValues(initial));
+});
+
+test('Today uses the same chart layout with 24 hourly buckets, gaps and measured zero', () => {
+  const data = hourlySummary({ 0: { beta: 100 }, 2: { alpha: 12 }, 3: { alpha: 13 },
+    5: { alpha: 0 }, 9: { alpha: null }, 12: { alpha: 30 } });
+  const view = viewer('today');
+  const html = view.renderOutputSpeedTrend(data);
+  assert.match(html, /xl:grid-cols-\[minmax\(0,1fr\)_304px\]/);
+  assert.match(html, /<svg[^>]*class="w-full h-56"[^>]*viewBox="0 0 720 220"/);
+  assert.match(html, />Filters<\/p>/);
+  assert.match(html, />Metric<\/div>/);
+  assert.match(html, /Output speed \(tokens\/s\)/);
+  const [alpha] = groups(html);
+  assert.equal(alpha.dots.length, 4);
+  assert.equal(count(alpha.path, 'M'), 3);
+  assert.equal(count(alpha.path, 'L'), 1);
+  assert.equal(tooltips(html).length, 24);
+  for (let hour = 0; hour < 24; hour++) {
+    assert.ok(tooltips(html)[hour].startsWith(`${String(hour).padStart(2, '0')}:00\n`));
+    if (hour > 12) assert.match(tooltips(html)[hour], /alpha: —\nbeta: —$/);
+  }
+  assert.match(html, /<text[^>]*>00:00<\/text>/);
+  assert.match(html, /<text[^>]*>23:00<\/text>/);
+  assert.match(activeValues(html), /12:00[\s\S]*alpha: 30/);
+  assert.equal(view.renderCostTrend(data), '');
+  view.click('output-speed', 'metric', 'beta');
+  const filtered = view.renderOutputSpeedTrend(data);
+  assert.deepEqual(groups(filtered).map(({ model }) => model), ['beta']);
+  assert.match(activeValues(filtered), /00:00[\s\S]*beta: 100/);
+  view.click('output-speed', 'all');
+  assert.deepEqual(groups(view.renderOutputSpeedTrend(data)), groups(html));
+});
+
+test('Today empty and unavailable hours retain the entire axis without invented points', () => {
+  for (const data of [hourlySummary(), hourlySummary({ 0: { alpha: null }, 12: { alpha: null } })]) {
+    const html = viewer('today').renderOutputSpeedTrend(data);
+    assert.match(html, /data-output-speed-chart/);
+    assert.equal(tooltips(html).length, 24);
+    assert.doesNotMatch(html, /<circle/);
+    assert.match(html, />00:00<\/text>/);
+    assert.match(html, />23:00<\/text>/);
+  }
+});
+
+test('Today selected empty hours show unavailable values and selection resets on a new date', () => {
+  const view = viewer('today');
+  const first = hourlySummary({ 2: { alpha: 8 }, 12: { alpha: 30 } });
+  const initial = view.renderOutputSpeedTrend(first);
+  view.click('output-speed', 'day', String(first.hours[9].start_ms));
+  const selected = view.renderOutputSpeedTrend(first);
+  assert.match(activeValues(selected), /09:00[\s\S]*alpha: —/);
+  assert.deepEqual(groups(selected), groups(initial));
+  assert.match(activeValues(view.renderOutputSpeedTrend(first)), /09:00/);
+  const next = hourlySummary({ 2: { alpha: 8 }, 12: { alpha: 31 } }, first.range.start_ms + 86400000);
+  assert.match(activeValues(view.renderOutputSpeedTrend(next)), /12:00[\s\S]*alpha: 31/);
 });
 
 test('legends and Metric buttons retain long names and wrap within the panel', () => {

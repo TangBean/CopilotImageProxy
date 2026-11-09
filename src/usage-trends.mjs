@@ -30,9 +30,12 @@ function handleModelDailyTrendClick(event) {
   }
 }
 
-function renderModelDailyTrend(dailySummary, error, { key, title, valueOf, includeTotal = false }) {
-  if (state.tokenUsagePeriod === 'today') return '';
-  const days = dailySummary?.days || [];
+function renderModelDailyTrend(dailySummary, error, { key, title, valueOf, includeTotal = false, hourly = false }) {
+  if (state.tokenUsagePeriod === 'today' && !hourly) return '';
+  const days = hourly
+    ? (dailySummary?.hours || []).map((hour) => ({ ...hour, date: String(hour.start_ms) }))
+    : dailySummary?.days || [];
+  const formatBucket = hourly ? (day) => day.hour : (day) => formatChartDate(day.date);
   const rows = days.map((day) => new Map((day.byModel || []).map((row) => [row.model, row])));
   const models = [...new Set([
     ...(dailySummary?.byModel || []).map((row) => row.model),
@@ -67,13 +70,13 @@ function renderModelDailyTrend(dailySummary, error, { key, title, valueOf, inclu
   }).join('');
 
   let body;
-  if (error) body = `<div class="p-4">${renderError(error, 'Daily model trend failed')}</div>`;
+  if (error) body = `<div class="p-4">${renderError(error, hourly ? 'Hourly model trend failed' : 'Daily model trend failed')}</div>`;
   else if (state.isTokenUsageLoading && !dailySummary) {
     body = '<div class="p-4 min-h-[14rem] text-sm animate-pulse" style="color: var(--color-gray);">Loading...</div>';
-  } else if (!days.length || (!models.length && !series.some(({ values }) => values.some((value) => value !== null)))) {
-    body = renderEmptyState('No daily model data for the selected period.');
+  } else if (!days.length || (!hourly && !models.length && !series.some(({ values }) => values.some((value) => value !== null)))) {
+    body = renderEmptyState(`No ${hourly ? 'hourly' : 'daily'} model data for the selected period.`);
   } else {
-    body = renderModelDailyTrendChart(days, series, visible, selection.day, key);
+    body = renderModelDailyTrendChart(days, series, visible, selection.day, key, formatBucket);
   }
   return `<section data-${key}-panel class="mt-3 grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_304px] gap-3">
     <div class="panel min-w-0">
@@ -92,7 +95,7 @@ function renderModelDailyTrend(dailySummary, error, { key, title, valueOf, inclu
   </section>`;
 }
 
-function renderModelDailyTrendChart(days, series, visible, selectedDay, key) {
+function renderModelDailyTrendChart(days, series, visible, selectedDay, key, formatBucket) {
   const width = 720, height = 220;
   const padding = { bottom: 34, left: 58, right: 16, top: 16 };
   const plotWidth = width - padding.left - padding.right;
@@ -121,7 +124,7 @@ function renderModelDailyTrendChart(days, series, visible, selectedDay, key) {
   }).join('');
   const labelEvery = Math.max(1, Math.ceil(days.length / 6));
   const labels = days.map((day, index) => index % labelEvery && index !== days.length - 1 ? '' :
-    `<text x="${x(index)}" y="${height - 10}" text-anchor="middle" font-size="11" fill="var(--color-gray-accent)">${escapeHtml(formatChartDate(day.date))}</text>`).join('');
+    `<text x="${x(index)}" y="${height - 10}" text-anchor="middle" font-size="11" fill="var(--color-gray-accent)">${escapeHtml(formatBucket(day))}</text>`).join('');
   const lines = visible.map(({ id, color, values }) => {
     let connected = false;
     const path = values.map((value, index) => {
@@ -141,7 +144,7 @@ function renderModelDailyTrendChart(days, series, visible, selectedDay, key) {
   const hover = days.map((day, index) => {
     const start = Math.max(padding.left, x(index) - hitWidth / 2);
     const end = Math.min(width - padding.right, x(index) + hitWidth / 2);
-    const tooltip = [formatChartDate(day.date), ...visible.map(({ label, values }) =>
+    const tooltip = [formatBucket(day), ...visible.map(({ label, values }) =>
       `${label}: ${formatModelTrendValue(values[index])}`)].join('\n');
     return `<rect data-${key}-day="${escapeHtml(day.date)}" x="${start}" y="${padding.top}" width="${end - start}" height="${plotHeight}" fill="transparent" style="cursor: pointer;"><title>${escapeHtml(tooltip)}</title></rect>`;
   }).join('');
@@ -156,7 +159,7 @@ function renderModelDailyTrendChart(days, series, visible, selectedDay, key) {
     </svg>
     <div data-${key}-legend class="mt-2 flex flex-wrap gap-5">${legend}</div>
     <div data-${key}-values class="mt-2 flex flex-wrap gap-3 px-3 py-2 text-xs" style="background-color: var(--color-bg-soft); color: var(--color-fg-dark);">
-      <span class="font-semibold" style="color: var(--color-fg-lightest);">${escapeHtml(formatChartDate(activeDay.date))}</span>${activeValues}
+      <span class="font-semibold" style="color: var(--color-fg-lightest);">${escapeHtml(formatBucket(activeDay))}</span>${activeValues}
     </div>
   </div>`;
 }
@@ -164,6 +167,7 @@ function renderModelDailyTrendChart(days, series, visible, selectedDay, key) {
 function renderOutputSpeedTrend(dailySummary, error) {
   return renderModelDailyTrend(dailySummary, error, {
     key: 'output-speed', title: 'Output speed (tokens/s)',
+    hourly: state.tokenUsagePeriod === 'today',
     valueOf: (row) => row?.output_tokens_per_second,
   });
 }

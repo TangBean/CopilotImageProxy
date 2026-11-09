@@ -40,6 +40,17 @@ export const tooltips = (html) => [...html.matchAll(/<title>([\s\S]*?)<\/title>/
 
 export const count = (html, marker) => html.split(marker).length - 1;
 
+export function hourlySummary(values = {}, start = Date.parse('2026-11-08T16:00:00Z')) {
+  return {
+    period: 'today', range: { start_ms: start, end_ms: start + 12.5 * 3600000 }, byModel: [],
+    hours: Array.from({ length: 24 }, (_, hour) => ({
+      hour: `${String(hour).padStart(2, '0')}:00`,
+      start_ms: start + hour * 3600000, end_ms: start + (hour + 1) * 3600000,
+      byModel: Object.entries(values[hour] || {}).map(([model, speed]) => ({ model, output_tokens_per_second: speed })),
+    })),
+  };
+}
+
 export function groups(html, key = 'output-speed') {
   return [...html.matchAll(new RegExp(`<g data-${key}-model="([^"]*)">([\\s\\S]*?)<\\/g>`, 'g'))]
     .map(([, model, body]) => ({

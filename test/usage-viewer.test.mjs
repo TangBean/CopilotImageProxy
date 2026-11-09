@@ -4,6 +4,7 @@ import test from 'node:test';
 import { runInNewContext } from 'node:vm';
 import { parseRelativeDayPeriod, UsageRangeError } from '../src/usage-range.mjs';
 import { rewriteUsageViewer, UsageViewerError } from '../src/usage-viewer.mjs';
+import { groups, hourlySummary, tooltips } from './helpers/usage-trends.mjs';
 
 const original = readFileSync(new URL('./fixtures/usage-viewer.upstream.html', import.meta.url));
 // Synthetic measurements in the daily response shape of copilot-api v2.7.43.
@@ -146,8 +147,9 @@ test('unavailable or unreadable title responses leave the dashboard usable', asy
 
 const tokenUsagePaths = ['/token-usage', '/token-usage/daily', '/token-usage/events', '/token-usage/sessions'];
 
-async function dashboardPage(path, source = html, initialDaily = null) {
+async function dashboardPage(path, source = html, initialDaily = null, initialHourly = hourlySummary()) {
   const requests = [];
+  const requestHeaders = [];
   const history = { pushed: [], replaced: [] };
   const elements = new Map();
   class Element {
@@ -213,6 +215,9 @@ async function dashboardPage(path, source = html, initialDaily = null) {
   let daily = initialDaily;
   let dailyGate = null;
   let dailyFailure = null;
+  let hourly = initialHourly;
+  let hourlyGate = null;
+  let hourlyFailure = null;
   const emptyTotals = { costs: [], input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0,
     cache_creation_input_tokens: 0, request_count: 0, total_nano_aiu: null, total_tokens: 0 };
   let ready;
@@ -232,10 +237,20 @@ async function dashboardPage(path, source = html, initialDaily = null) {
         return { value: '', textContent: '' };
       },
     },
-    fetch: async (input) => {
+    fetch: async (input, options) => {
       const url = new URL(input, window.location);
       requests.push(url);
-      assert.ok(['/usage', '/models', ...tokenUsagePaths].includes(url.pathname), url.href);
+      requestHeaders.push(options?.headers || {});
+      assert.ok(['/usage', '/models', ...tokenUsagePaths, '/token-usage/hourly'].some((path) => url.pathname.endsWith(path)), url.href);
+      if (url.pathname.endsWith('/token-usage/hourly')) {
+        const payload = structuredClone(hourly);
+        const failure = hourlyFailure;
+        const pending = hourlyGate;
+        hourlyGate = null;
+        if (pending) await pending;
+        if (failure) throw new Error(failure);
+        return { ok: true, json: async () => payload };
+      }
       if (url.pathname === '/token-usage/daily') {
         if (dailyGate) await dailyGate;
         if (dailyFailure) throw new Error(dailyFailure);
@@ -265,12 +280,22 @@ async function dashboardPage(path, source = html, initialDaily = null) {
   const settle = () => new Promise(setImmediate);
   await settle();
   return {
-    requests, history, select, viewer: sandbox.viewer,
+    requests, requestHeaders, history, select, viewer: sandbox.viewer,
     get state() { return sandbox.viewer.state; },
     get url() { return window.location; },
     get rendered() { return elements.get('content-area').innerHTML; },
     get periodHidden() { return elements.get('token-usage-period-field').hidden; },
     setDaily(data) { daily = structuredClone(data); dailyFailure = null; },
+    setHourly(data) { hourly = structuredClone(data); hourlyFailure = null; },
+    failHourly(message) { hourlyFailure = message; },
+    pauseHourly() {
+      let release;
+      hourlyGate = new Promise((resolve) => { release = resolve; });
+      return async () => {
+        release();
+        await settle();
+      };
+    },
     pauseDaily() {
       let release;
       dailyGate = new Promise((resolve) => { release = resolve; });
@@ -327,6 +352,7 @@ async function dashboardPage(path, source = html, initialDaily = null) {
 }
 
 function assertTokenUsageRequests(requests, period, paths = tokenUsagePaths) {
+  if (period !== 'today') assert.equal(requests.some((url) => url.pathname.endsWith('/token-usage/hourly')), false);
   const tokenRequests = requests.filter((url) => tokenUsagePaths.includes(url.pathname));
   assert.deepEqual(tokenRequests.map((url) => url.pathname).sort(), [...paths].sort());
   for (const url of tokenRequests) {
@@ -559,7 +585,8 @@ test('real v2.7.43 render flow places independent speed and cost panels after th
     assert.doesNotMatch(cost, /EUR/);
   }
   const today = await dashboardPage('?period=today&endpoint=%2Fusage', html, dailyFixture);
-  assert.doesNotMatch(today.rendered, /Token Usage Over Time|data-output-speed-panel|data-cost-panel/);
+  assert.match(today.rendered, /data-output-speed-chart/);
+  assert.doesNotMatch(today.rendered, /Token Usage Over Time|data-cost-panel/);
 });
 
 test('actual upstream model and metric handlers re-render without filtering either new panel', async () => {
@@ -710,7 +737,7 @@ test('changing period, endpoint or credential clears prior chart data while requ
   }
 });
 
-test('refresh replaces speed and cost measurements and period changes remove and restore both panels', async () => {
+test('refresh replaces speed and cost measurements and period changes switch chart granularity', async () => {
   const view = await dashboardPage('?period=-34day&endpoint=%2Fusage', html, dailyFixture);
   const initialPanel = outputSpeedPanel(view.rendered);
   const initialCost = costPanel(view.rendered);
@@ -727,7 +754,8 @@ test('refresh replaces speed and cost measurements and period changes remove and
   assert.match(outputSpeedPanel(view.rendered), /model-alpha: 9876.5/);
   assert.match(costPanel(view.rendered), /model-alpha: 0\.123456/);
   await view.selectPeriod('today');
-  assert.doesNotMatch(view.rendered, /data-output-speed-panel|data-cost-panel/);
+  assert.match(view.rendered, /data-output-speed-chart/);
+  assert.doesNotMatch(view.rendered, /data-cost-panel/);
   await view.selectPeriod('lifetime');
   assertTrendPanelOrder(view.rendered);
   assert.match(outputSpeedPanel(view.rendered), /model-alpha: 9876.5/);
@@ -781,6 +809,120 @@ test('each model keeps the same color in speed and cost charts across re-renders
   assert.deepEqual(colors(costPanel(view.rendered), 'cost'), speed);
 });
 
+test('Today fetches hourly speeds from the selected endpoint with credentials and independent filters', async () => {
+  const data = hourlySummary({ 0: { alpha: 7 }, 2: { alpha: 8, beta: 50 }, 12: { alpha: 9 } });
+  const view = await dashboardPage('?period=today&endpoint=https%3A%2F%2Fexample.test%2Fprefix%2Fusage', html, dailyFixture, data);
+  const hourlyRequests = () => view.requests.filter((url) => url.pathname.endsWith('/token-usage/hourly'));
+  assert.equal(hourlyRequests().length, 1);
+  assert.equal(hourlyRequests()[0].href, 'https://example.test/prefix/token-usage/hourly?period=today');
+  const panel = outputSpeedPanel(view.rendered);
+  assert.equal(tooltips(panel).length, 24);
+  assert.equal(groups(panel)[0].dots.length, 3);
+  assert.match(panel, />00:00<\/text>/);
+  assert.match(panel, />23:00<\/text>/);
+  assert.ok(view.rendered.indexOf('data-output-speed-panel') < view.rendered.indexOf('Model Breakdown'));
+  assert.doesNotMatch(view.rendered, /Token Usage Over Time|data-cost-panel/);
+  view.clickModelMetric('beta');
+  assert.deepEqual(groups(outputSpeedPanel(view.rendered)).map(({ model }) => model), ['beta']);
+  view.clickNewChartDay(String(data.hours[4].start_ms));
+  assert.match(outputSpeedPanel(view.rendered), /data-output-speed-values[^>]*>[\s\S]*04:00[\s\S]*beta: —/);
+  assert.equal(hourlyRequests().length, 1, 'Filtering and selecting hours must not fetch');
+  view.setCredential('Bearer hourly-test-credential');
+  await view.submit();
+  const index = view.requests.findLastIndex((url) => url.pathname.endsWith('/token-usage/hourly'));
+  assert.equal(view.requestHeaders[index].authorization, 'Bearer hourly-test-credential');
+  assert.equal(hourlyRequests().length, 2);
+  await view.selectPeriod('lifetime');
+  assert.equal(hourlyRequests().length, 2, 'Non-Today periods must not fetch hourly data');
+});
+
+test('Today refresh retains the graph while loading, adds current-hour data and isolates hourly failures', async () => {
+  const view = await dashboardPage('?period=today&endpoint=%2Fusage', html, dailyFixture,
+    hourlySummary({ 2: { alpha: 10 } }));
+  const release = view.pauseHourly();
+  view.setHourly(hourlySummary({ 2: { alpha: 10 }, 12: { alpha: 20 } }));
+  await view.submit();
+  assert.match(outputSpeedPanel(view.rendered), /opacity-60/);
+  assert.equal(groups(outputSpeedPanel(view.rendered))[0].dots.length, 1);
+  await release();
+  let panel = outputSpeedPanel(view.rendered);
+  assert.doesNotMatch(panel, /opacity-60/);
+  assert.equal(groups(panel)[0].dots.length, 2);
+  assert.match(panel, /data-output-speed-values[^>]*>[\s\S]*12:00[\s\S]*alpha: 20/);
+  assert.equal(tooltips(panel).length, 24);
+  assert.ok(tooltips(panel).slice(13).every((title) => title.endsWith('alpha: —')));
+  view.failHourly('<hourly unavailable>');
+  await view.submit();
+  panel = outputSpeedPanel(view.rendered);
+  assert.match(panel, /Hourly model trend failed/);
+  assert.match(panel, /&lt;hourly unavailable&gt;/);
+  assert.doesNotMatch(panel, /<svg|<circle|<hourly unavailable>/);
+  assert.equal(view.state.tokenUsageDailyError, null);
+  assert.equal(view.state.tokenUsageSummaryError, null);
+  for (const heading of ['Model Breakdown', 'Session Breakdown', 'Request Events']) assert.ok(view.rendered.includes(heading));
+  view.setHourly(hourlySummary());
+  await view.submit();
+  panel = outputSpeedPanel(view.rendered);
+  assert.match(panel, /data-output-speed-chart/);
+  assert.equal(tooltips(panel).length, 24);
+  assert.doesNotMatch(panel, /<circle|role="alert"/);
+});
+
+test('Today speed data remains available when the independent daily request fails', async () => {
+  const view = await dashboardPage('?period=today&endpoint=%2Fusage', html, dailyFixture,
+    hourlySummary({ 12: { alpha: 11 } }));
+  const release = view.pauseDaily();
+  await view.submit();
+  await release('daily unavailable');
+  assert.equal(view.state.tokenUsageDailyError, 'daily unavailable');
+  assert.match(outputSpeedPanel(view.rendered), /alpha: 11/);
+  assert.doesNotMatch(outputSpeedPanel(view.rendered), /role="alert"/);
+});
+
+test('a different Today endpoint or credential clears previous hourly data before the response', async () => {
+  for (const change of ['endpoint', 'credential']) {
+    const view = await dashboardPage('?period=today&endpoint=%2Fusage', html, dailyFixture,
+      hourlySummary({ 12: { old: 1 } }));
+    const release = view.pauseHourly();
+    view.setHourly(hourlySummary({ 12: { fresh: 2 } }));
+    if (change === 'endpoint') view.setEndpoint('https://another.test/usage');
+    else view.setCredential('different-credential');
+    await view.submit();
+    assert.equal(view.state.tokenUsageHourlySummary, null, change);
+    assert.equal(view.state.isTokenUsageLoading, true, change);
+    assert.doesNotMatch(view.rendered, /data-output-speed-chart|old: 1/, change);
+    await release();
+    assert.match(outputSpeedPanel(view.rendered), /fresh: 2/, change);
+  }
+});
+
+test('older hourly requests cannot restore stale data or errors after period, endpoint or credential changes', async () => {
+  for (const change of ['period', 'endpoint', 'credential', 'empty-endpoint']) {
+    const view = await dashboardPage('?period=today&endpoint=%2Fusage', html, dailyFixture,
+      hourlySummary({ 12: { old: 1 } }));
+    if (change === 'credential') view.failHourly('stale credential error');
+    const release = view.pauseHourly();
+    await view.submit();
+    view.setHourly(hourlySummary({ 12: { fresh: 2 } }));
+    if (change === 'period') await view.selectPeriod('lifetime');
+    else {
+      if (change === 'endpoint') view.setEndpoint('https://another.test/usage');
+      if (change === 'credential') view.setCredential('new-credential');
+      if (change === 'empty-endpoint') view.setEndpoint('');
+      await view.submit();
+    }
+    const currentPanel = outputSpeedPanel(view.rendered);
+    const currentError = view.state.tokenUsageHourlyError;
+    const currentSummary = view.state.tokenUsageHourlySummary;
+    await release();
+    assert.equal(view.state.tokenUsageHourlySummary, currentSummary, change);
+    assert.equal(view.state.tokenUsageHourlyError, currentError, change);
+    assert.equal(outputSpeedPanel(view.rendered), currentPanel, change);
+    assert.equal(view.state.isTokenUsageLoading, false, change);
+    assert.doesNotMatch(outputSpeedPanel(view.rendered), /old: 1|stale credential error/, change);
+  }
+});
+
 const originalText = original.toString();
 function upstreamFunction(name) {
   const start = originalText.indexOf(`function ${name}(`);
@@ -808,7 +950,19 @@ const requiredMarkers = [
   ['trend empty state', 'function renderEmptyState(message) {'],
   ['trend click binding', 'contentArea.addEventListener("click", handleContentAreaClick);'],
   ['trend refresh display', 'if (state.isLoading) {'],
+  ['hourly content visibility', 'const hasContent = Boolean(state.isTokenUsageLoading || state.isEventsLoading'],
+  ['hourly section visibility', 'const hasTokenUsageContent = Boolean('],
+  ['trend request identity', 'async function fetchTokenUsageSummaryAndEvents(page = 1) {'],
+  ['hourly invalid endpoint', 'if (!endpoint) {\n            state.tokenUsageDailySummary = null;'],
   ['trend refresh data', 'const period = getSelectedPeriod();\n          state.isTokenUsageLoading = true;\n          state.tokenUsageDailySummary = null;'],
+  ['hourly request', `const [summaryResult, dailyResult, eventsResult] =
+              await Promise.allSettled([
+                fetchJson(buildTokenUsageSummaryUrl(usageUrl, period)),
+                fetchJson(buildTokenUsageDailyUrl(usageUrl, period)),
+                fetchJson(buildTokenUsageEventsUrl(usageUrl, period, page)),
+              ]);`],
+  ['hourly request error', 'console.error("Token usage fetch error:", error);'],
+  ['trend request completion', 'state.isTokenUsageLoading = false;\n            render("usage");'],
   ['closing body', '</body>'],
 ];
 

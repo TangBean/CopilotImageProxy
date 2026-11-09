@@ -110,7 +110,7 @@ Invoke-RestMethod 'http://127.0.0.1:4142/healthz'
 | `maxImageQueueMiB` | 图片候选请求的 worker 队列容量预算，默认 256 MiB；满时本地返回 503，不发送上游。 |
 | `logLevel` | 代理日志最低级别，默认 `info`；支持 `debug`、`info`、`warn`、`error`、`silent`，修改后手动重启生效。 |
 | `sessionIndexPath` | Codex 会话标题索引路径；默认 `null`，使用当前用户主目录下的 `.codex/session_index.jsonl`。可指定非空路径字符串，相对路径按代理进程当前目录解析。 |
-| `sqliteDbPath` | 相对日用量的只读 SQLite 路径；默认 `null`，依次使用 `COPILOT_API_SQLITE_DB_PATH` 环境变量或 `~/.local/share/copilot-api/copilot-api.sqlite`。可指定非空路径，相对路径按代理进程当前目录解析。 |
+| `sqliteDbPath` | 相对日用量及 Today 小时速度的只读 SQLite 路径；默认 `null`，依次使用 `COPILOT_API_SQLITE_DB_PATH` 环境变量或 `~/.local/share/copilot-api/copilot-api.sqlite`。可指定非空路径，相对路径按代理进程当前目录解析。 |
 | `usageTimezone` | 相对日的自然日时区，默认 `+08:00`；支持 `Z` 或 `-14:00` 到 `+14:00` 的固定 UTC 偏移（`±HH:mm`），例如 `-05:00`、`+05:30`。不支持地区名或夏令时切换。 |
 | `plaintextCollaborationModels` | 为列表内模型启用 Codex v2 明文协作适配，默认 `[]`。首版仅接受 `gpt-6-astra`、`gpt-6.1-sol`，精确匹配入站 `model`。 |
 | `earlyResponseErrorModels` | 为列表内模型启用初始 SSE 错误检查，默认 `[]`；支持相同两个模型，与明文适配独立。 |
@@ -125,7 +125,7 @@ Invoke-RestMethod 'http://127.0.0.1:4142/healthz'
 - 两项协作兼容配置均为空时，无图片标记且无 Unicode 转义的请求直接通过，不做 JSON 解析；存在 `input_image` 或 `\u` 候选时回退解析，防止转义图片类型漏过。配置了兼容模型列表时，普通 Responses 请求另行解析以匹配模型与工具合同。无图路径仍检查字节预算；无图的畸形 JSON 交给上游验证。
 - 图片候选请求的 JSON 与图片处理使用按需创建的单例 worker，避免这些同步计算占用 HTTP 主线程。队列有独立容量上限；worker 的性能实测以验收记录为准。
 - 两级内存缓存分别识别相同 data URL 和相同解码内容，保存最终输出 URL，重复历史图命中时避免再次解码或有损编码。缓存不把原图写到磁盘，缓存容量不等于整个服务的 RSS。
-- 支持解压 zstd、gzip 和 deflate 入站请求，向上游发送普通 JSON 并更新长度、编码相关 headers。`GET /healthz`、`GET /__session-titles` 和下述相对日用量查询由本地处理，`GET /usage-viewer` 按下述条件改写页面，其余路由按字节流透传。
+- 支持解压 zstd、gzip 和 deflate 入站请求，向上游发送普通 JSON 并更新长度、编码相关 headers。`GET /healthz`、`GET /__session-titles` 和下述相对日用量查询由本地处理，Today 小时速度结合上游日期范围与本地数据库生成，`GET /usage-viewer` 按下述条件改写页面，其余路由按字节流透传。
 - 默认 SSE 逐块转发；启用协作兼容时按预算预检或按事件改写，写入仍遵守背压。客户端取消会取消对应上游请求。上游 HTTP 错误透传，每个入站请求最多发出一次上游请求。Codex 自身的重试仍可能产生新的入站请求。
 
 ## 用量页面：相对自然日与 Codex 会话标题
@@ -144,7 +144,7 @@ Invoke-RestMethod 'http://127.0.0.1:4142/healthz'
 
 此功能仅用于 Web Dashboard，不影响桌面 Electron Dashboard。上游返回未压缩的 200 HTML 页面时，代理按唯一的上游代码标记改写周期校验、初始化和 URL 同步；标记缺失或重复会明确返回 502，避免把相对日静默显示为 Today。请求相对日页面时，上游若返回压缩内容或其他不兼容的成功响应，也返回 502；其他响应保持透传。本地相对日 API 支持来自 `localhost`、`127.0.0.1` 和 `[::1]` 的 HTTP(S) 跨来源访问及预检，便于切换本机页面地址或 endpoint。
 
-### 按模型查看每日趋势
+### 按模型查看速度和成本趋势
 
 选择非 Today 周期时，原有 Token Usage Over Time 下方依次增加独立的 Output speed (tokens/s) 和 Cost (USD) 面板。
 原生周期和代理 `-Nd` 均适用；`-Nd` 仍表示 N 天前的单个自然日，因此显示一个点。
@@ -160,10 +160,16 @@ Invoke-RestMethod 'http://127.0.0.1:4142/healthz'
 成本读取 `days[].byModel[].costs[]` 中的 USD 项，复用页面的 `getCostAmount`：优先 `amount`，否则 `total_cost_nanos / 1e9`。
 Total 使用每日 `days[].totals.costs[]` 中的 USD 汇总，同样保留缺失值和真实零值，不在页面重算模型费用之和。
 v2.7.43 daily 的模型和 totals 均已有 `costs[]`；它是事件中已记录费用按日期、模型、币种求和，并非按 token 重新估价。
-代理 `-Nd` 的只读 SQLite 查询已输出相同结构和单位，本次无需修改 SQL；测试核对 summary 与 daily 的费用一致性。
+代理 `-Nd` 的只读 SQLite 查询输出相同结构和单位，测试核对 summary 与 daily 的费用一致性。
 只显示美元，不换汇、不混加其他币种；无 USD 记录时显示 `—` 并断线，已记录的零费用保持为 0。
 两个面板对同一模型使用相同颜色；成本提示保留有效小数，1 nano USD 也不会显示成零。
 窄屏中 Filters 排列在图下，图例与长模型名自动换行；大数和极小数的纵轴刻度使用科学计数法。
+
+Today 显示同样样式的 Output speed (tokens/s) 面板，横轴固定为当天 00:00–23:00，按小时汇总每个模型的速度。没有有效速度数据的小时不画点，并在该处断线；当前小时有数据就显示，随 Refresh 更新，未来小时留空。筛选、悬停、点击小时及刷新行为与每日速度图一致。
+
+`GET /token-usage/hourly?period=today` 使用上游原生 Today 的范围，并从 `sqliteDbPath` 指向的数据库只读统计完整请求；`usageTimezone` 仍只控制相对日。每个有效请求的全部输出 token 和输出耗时归入最后一条用量记录所在小时，再按上述公式加权计算。用量记录跨整点的请求只统计一次；跨 Today 边界、取消或计时不完整的请求按现有完整请求规则排除。
+
+小时响应提供 24 个 `hours` 桶，每桶包含 `hour`、`start_ms`、`end_ms` 和 `byModel`。页面从当前 endpoint 派生小时接口；覆盖 endpoint 时，目标也须支持该接口。数据库不可读或结构不兼容时返回 501，页面仅在速度面板显示错误，其余用量数据仍可查看。
 
 ## Codex v2 明文协作兼容
 

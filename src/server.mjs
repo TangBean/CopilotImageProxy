@@ -10,12 +10,12 @@ import { createPlaintextCollaboration, CollaborationError } from './collaboratio
 import { adaptSse, preflightSse, readJsonResponse, writeStream, ResponseStreamError, MAX_JSON_RESPONSE_BYTES } from './responses-stream.mjs';
 import { createSessionTitleReader } from './session-titles.mjs';
 import { rewriteUsageViewer, UsageViewerError } from './usage-viewer.mjs';
-import { createRelativeDayRange, createUsageRangeReader, parseRelativeDayPeriod, UsageRangeError } from './usage-range.mjs';
+import { createRelativeDayRange, createUsageHourlyReader, createUsageRangeReader, parseRelativeDayPeriod, UsageRangeError } from './usage-range.mjs';
 
 const decompressors = { zstd: promisify(zstdDecompress), gzip: promisify(gunzip), deflate: promisify(inflate) };
 const transformedRoutes = new Set(['/responses', '/responses/compact', '/v1/responses', '/v1/responses/compact']);
 const compatibilityRoutes = new Set(['/responses', '/v1/responses']);
-const usageRangeRoutes = new Set(['/token-usage', '/token-usage/daily', '/token-usage/events', '/token-usage/sessions']);
+const usageRangeRoutes = new Set(['/token-usage', '/token-usage/daily', '/token-usage/events', '/token-usage/sessions', '/token-usage/hourly']);
 const imageMarker = Buffer.from('input_image');
 const unicodeEscapeMarker = Buffer.from([0x5c, 0x75]);
 const hopHeaders = new Set(['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
@@ -84,6 +84,7 @@ export function createProxyServer({ config: overrides = {}, log = () => {}, mana
   const config = validateConfig(overrides, { managedUpstream });
   const readSessionTitles = createSessionTitleReader(config.sessionIndexPath);
   const readUsageRange = createUsageRangeReader(config);
+  const readUsageHourly = createUsageHourlyReader(config);
   const upstreamBase = new URL(config.upstream);
   const transformer = createBodyTransformer({ config, useWorker });
   const agents = { 'http:': new http.Agent({ keepAlive: true }), 'https:': new https.Agent({ keepAlive: true }) };
@@ -98,6 +99,7 @@ export function createProxyServer({ config: overrides = {}, log = () => {}, mana
     let collaboration;
     let inspectEarlyError = false;
     let usageViewer = false;
+    let usageHourly = false;
     let relativeUsageViewer = false;
     let responseHandled = false;
     const metrics = { requestId, method: req.method, upstreamRequests: 0 };
@@ -126,16 +128,17 @@ export function createProxyServer({ config: overrides = {}, log = () => {}, mana
     res.once('finish', finishLog);
     const failResponse = (error) => {
       if (signal.aborted || res.destroyed || res.writableEnded) return;
-      const local = error instanceof CollaborationError || error instanceof ResponseStreamError || error instanceof UsageViewerError ? error
+      const local = error instanceof CollaborationError || error instanceof ResponseStreamError || error instanceof UsageViewerError || error instanceof UsageRangeError ? error
         : new ResponseStreamError('proxy_upstream_stream_error', '无法读取完整上游响应。');
-      metrics.error = local.code;
-      metrics.abortSource = error instanceof CollaborationError || error instanceof ResponseStreamError || error instanceof UsageViewerError ? 'proxy' : 'upstream';
+      metrics.error = local.code ?? local.type;
+      metrics.abortSource = local === error ? 'proxy' : 'upstream';
       responseHandled = true;
       controller.abort(local);
       if (res.headersSent) res.destroy();
       else {
-        res.writeHead(local.status, { 'content-type': 'application/json; charset=utf-8', connection: 'close' });
-        res.end(JSON.stringify({ error: { code: local.code, message: local.message } }));
+        res.writeHead(local.status, { 'content-type': 'application/json; charset=utf-8', connection: 'close',
+          ...(usageHourly ? { ...usageCorsHeaders(req.headers.origin), 'cache-control': 'no-store' } : {}) });
+        res.end(JSON.stringify({ error: { ...(local.type ? { type: local.type } : { code: local.code }), message: local.message } }));
       }
       upstreamResponse?.destroy(); upstreamRequest?.destroy();
     };
@@ -145,6 +148,21 @@ export function createProxyServer({ config: overrides = {}, log = () => {}, mana
       const success = incoming.statusCode >= 200 && incoming.statusCode < 300;
       const type = String(incoming.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
       const encoding = String(incoming.headers['content-encoding'] || '').trim().toLowerCase();
+      if (usageHourly) Object.assign(headers, usageCorsHeaders(req.headers.origin), { 'cache-control': 'no-store' });
+      if (usageHourly && success) {
+        if (incoming.statusCode !== 200 || !/(?:\/|\+)json$/.test(type) || (encoding && encoding !== 'identity')) {
+          throw new UsageRangeError(502, 'usage_hourly_unavailable', 'Hourly usage requires an uncompressed 200 JSON Today response.');
+        }
+        const daily = await readJsonResponse(incoming, { signal });
+        const usage = await readUsageHourly(daily.range);
+        signal.throwIfAborted();
+        metrics.route = '/token-usage/hourly';
+        responseHandled = true;
+        res.writeHead(200, { ...usageCorsHeaders(req.headers.origin),
+          'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+        res.end(JSON.stringify(usage));
+        return;
+      }
       if (relativeUsageViewer && success &&
           (incoming.statusCode !== 200 || type !== 'text/html' || (encoding && encoding !== 'identity'))) {
         throw new UsageViewerError('Upstream usage viewer is incompatible: relative-day periods require an uncompressed 200 HTML response.');
@@ -231,10 +249,14 @@ export function createProxyServer({ config: overrides = {}, log = () => {}, mana
         if (params.getAll('period').length > 1) {
           throw new UsageRangeError(400, 'invalid_request_error', 'Specify period only once.');
         }
+        usageHourly = route === '/token-usage/hourly';
+        if (usageHourly && params.has('period') && params.get('period') !== 'today') {
+          throw new UsageRangeError(400, 'invalid_request_error', 'Hourly usage supports period=today only.');
+        }
         const relativePeriod = parseRelativeDayPeriod(params.get('period'));
         relativeUsageViewer = req.method === 'GET' && route === '/usage-viewer' && relativePeriod !== null;
         if (relativeUsageViewer) createRelativeDayRange(relativePeriod, config.usageTimezone);
-        if (req.method === 'OPTIONS' && usageRangeRoutes.has(route) && relativePeriod !== null) {
+        if (req.method === 'OPTIONS' && usageRangeRoutes.has(route) && (relativePeriod !== null || usageHourly)) {
           res.writeHead(204, {
             ...usageCorsHeaders(req.headers.origin), 'cache-control': 'no-store',
             'access-control-allow-methods': 'GET',
@@ -243,7 +265,10 @@ export function createProxyServer({ config: overrides = {}, log = () => {}, mana
           res.end();
           return;
         }
-        if (req.method === 'GET' && usageRangeRoutes.has(route)) {
+        if (usageHourly && req.method !== 'GET') {
+          throw new UsageRangeError(405, 'invalid_request_error', 'Hourly usage supports GET only.');
+        }
+        if (req.method === 'GET' && usageRangeRoutes.has(route) && !usageHourly) {
           const usage = await readUsageRange(route, params);
           if (usage !== null) {
             if (signal.aborted) return;
@@ -271,7 +296,7 @@ export function createProxyServer({ config: overrides = {}, log = () => {}, mana
       let body;
       const headers = headersWithoutHopByHop(req.headers);
       delete headers.host;
-      if (usageViewer) headers['accept-encoding'] = 'identity';
+      if (usageViewer || usageHourly) headers['accept-encoding'] = 'identity';
       if (req.method === 'POST' && transformedRoutes.has(route)) {
         const inputLimit = Math.floor(config.maxInputMiB * 1048576);
         const raw = await readBody(req, inputLimit, signal);
@@ -318,7 +343,7 @@ export function createProxyServer({ config: overrides = {}, log = () => {}, mana
       }
       signal.throwIfAborted();
       const transport = upstreamBase.protocol === 'https:' ? https : http;
-      const upstreamPath = upstreamBase.pathname.replace(/\/$/, '') + req.url;
+      const upstreamPath = upstreamBase.pathname.replace(/\/$/, '') + (usageHourly ? '/token-usage/daily?period=today' : req.url);
       upstreamRequest = transport.request(upstreamBase, { method: req.method, path: upstreamPath,
         headers, agent: agents[upstreamBase.protocol] });
       metrics.upstreamRequests = 1;
@@ -340,7 +365,8 @@ export function createProxyServer({ config: overrides = {}, log = () => {}, mana
         metrics.error ||= 'proxy_upstream_unavailable';
         if (res.headersSent) { metrics.abortSource ||= 'upstream'; res.destroy(); }
         else {
-          res.writeHead(502, { 'content-type': 'application/json; charset=utf-8' });
+          res.writeHead(502, { 'content-type': 'application/json; charset=utf-8',
+            ...(usageHourly ? { ...usageCorsHeaders(req.headers.origin), 'cache-control': 'no-store' } : {}) });
           res.end(JSON.stringify({ error: { code: metrics.error, message: '无法连接或读取原 copilot-api，请检查其运行状态。' } }));
         }
       });
