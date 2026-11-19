@@ -6,13 +6,10 @@ import { zstdDecompress, gunzip, inflate } from 'node:zlib';
 import { createBodyTransformer, BodyTransformError } from './body-transformer.mjs';
 import { validateConfig } from './config.mjs';
 import { VERSION } from './version.mjs';
-import { createPlaintextCollaboration, CollaborationError } from './collaboration-plaintext.mjs';
-import { adaptSse, preflightSse, readJsonResponse, writeStream, ResponseStreamError, MAX_JSON_RESPONSE_BYTES } from './responses-stream.mjs';
 import { createUsageRouter, usageErrorReply } from './usage-routes.mjs';
 
 const decompressors = { zstd: promisify(zstdDecompress), gzip: promisify(gunzip), deflate: promisify(inflate) };
 const transformedRoutes = new Set(['/responses', '/responses/compact', '/v1/responses', '/v1/responses/compact']);
-const compatibilityRoutes = new Set(['/responses', '/v1/responses']);
 const imageMarker = Buffer.from('input_image');
 const unicodeEscapeMarker = Buffer.from([0x5c, 0x75]);
 const hopHeaders = new Set(['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
@@ -80,14 +77,10 @@ export function createProxyServer({ config: overrides = {}, log = () => {}, mana
     const { signal } = controller;
     let upstreamRequest; let upstreamResponse;
     let dashboard;
-    let collaboration;
-    let inspectEarlyError = false;
-    let responseHandled = false;
     const metrics = { requestId, method: req.method, upstreamRequests: 0 };
     let logged = false;
     const finishLog = () => {
       if (logged) return; logged = true;
-      if (collaboration) metrics.plaintextCollaboration.restoredCalls = collaboration.stats.restoredCalls;
       safeLog({ event: 'request', ...metrics, status: res.headersSent ? res.statusCode : null,
         aborted: signal.aborted, durationMs: Math.round(performance.now() - started) });
     };
@@ -114,13 +107,9 @@ export function createProxyServer({ config: overrides = {}, log = () => {}, mana
     };
     const failResponse = (error) => {
       if (signal.aborted || res.destroyed || res.writableEnded) return;
-      const reply = error instanceof CollaborationError || error instanceof ResponseStreamError
-        ? { status: error.status, error: error.code, headers: { 'content-type': 'application/json; charset=utf-8' },
-          body: JSON.stringify({ error: { code: error.code, message: error.message } }) }
-        : usageErrorReply(error, dashboard?.headers);
+      const reply = usageErrorReply(error, dashboard?.headers);
       metrics.error = reply?.error ?? 'proxy_upstream_stream_error';
       metrics.abortSource = reply ? 'proxy' : 'upstream';
-      responseHandled = true;
       controller.abort(error);
       if (res.headersSent) res.destroy();
       else {
@@ -141,64 +130,11 @@ export function createProxyServer({ config: overrides = {}, log = () => {}, mana
           return;
         }
       }
-      const success = incoming.statusCode >= 200 && incoming.statusCode < 300;
-      const type = String(incoming.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
-      const encoding = String(incoming.headers['content-encoding'] || '').trim().toLowerCase();
-      const sse = type === 'text/event-stream';
-      const needsRead = success && (collaboration || (inspectEarlyError && sse));
-      if (!needsRead) {
-        res.writeHead(incoming.statusCode, headers); res.flushHeaders();
-        incoming.once('error', () => upstreamStreamFailed('proxy_upstream_stream_error'));
-        incoming.once('aborted', () => upstreamStreamFailed('proxy_upstream_stream_aborted'));
-        incoming.pipe(res);
-        return;
-      }
-      if (encoding && encoding !== 'identity') throw new ResponseStreamError('proxy_response_encoding', '上游未遵守 identity 响应编码要求。');
-      if (collaboration) {
-        for (const name of ['content-length', 'content-encoding', 'content-md5', 'digest', 'etag']) delete headers[name];
-      }
-      if (!sse) {
-        if (!/(?:\/|\+)json$/.test(type)) throw new ResponseStreamError('proxy_response_content_type', '明文协作需要 JSON 或 SSE 响应。');
-        const response = collaboration.restoreResponse(await readJsonResponse(incoming, { signal }));
-        const bytes = Buffer.from(JSON.stringify(response));
-        if (bytes.length > MAX_JSON_RESPONSE_BYTES) throw new ResponseStreamError('proxy_json_response_limit', '改写后的 JSON 响应超过 32 MiB 限制。');
-        headers['content-length'] = String(bytes.length);
-        metrics.plaintextCollaboration.restoredCalls = collaboration.stats.restoredCalls;
-        responseHandled = true;
-        res.writeHead(incoming.statusCode, headers); res.end(bytes);
-        return;
-      }
-      const prepared = inspectEarlyError ? await preflightSse(incoming, { signal }) : undefined;
-      if (prepared) Object.assign(metrics.earlyResponseError, prepared.stats);
-      if (prepared?.error) {
-        responseHandled = true;
-        metrics.error = prepared.error.code;
-        incoming.destroy(); upstreamRequest.destroy();
-        void prepared.close().catch(() => {});
-        res.writeHead(400, { 'content-type': 'application/json; charset=utf-8', connection: 'close' });
-        res.end(JSON.stringify({ error: prepared.error }));
-        return;
-      }
-      const source = prepared?.stream ?? incoming;
-      const stream = collaboration ? adaptSse(source, collaboration, { signal }) : source;
-      // Validate an available first frame before headers. A timed-out preflight
-      // must retain its deadline even if the upstream has not finished a frame.
-      const iterator = stream[Symbol.asyncIterator]();
-      const first = collaboration && (!prepared || prepared.hasFrames) ? await iterator.next() : undefined;
-      const replay = async function* () {
-        try {
-          if (first && !first.done) yield first.value;
-          if (!first?.done) for (;;) {
-            const next = await iterator.next();
-            if (next.done) break;
-            yield next.value;
-          }
-        } finally { await iterator.return?.(); }
-      };
-      res.writeHead(incoming.statusCode, headers); res.flushHeaders();
-      try { await writeStream(res, replay()); }
-      finally { if (collaboration) metrics.plaintextCollaboration.restoredCalls = collaboration.stats.restoredCalls; }
-      responseHandled = true;
+      res.writeHead(incoming.statusCode, headers);
+      res.flushHeaders();
+      incoming.once('error', () => upstreamStreamFailed('proxy_upstream_stream_error'));
+      incoming.once('aborted', () => upstreamStreamFailed('proxy_upstream_stream_aborted'));
+      incoming.pipe(res);
     };
     try {
       if (!req.url?.startsWith('/')) throw new ProxyError(400, 'proxy_invalid_target', '请求路径必须使用 origin form。');
@@ -239,22 +175,6 @@ export function createProxyServer({ config: overrides = {}, log = () => {}, mana
           metrics.images = transformed.stats;
           body = transformed.body;
         }
-        if (compatibilityRoutes.has(route)
-          && (config.plaintextCollaborationModels.length || config.earlyResponseErrorModels.length)) {
-          let payload;
-          // Keep malformed, image-free requests on the existing upstream validation path.
-          try { payload = JSON.parse(body.toString('utf8')); } catch {}
-          if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
-            inspectEarlyError = config.earlyResponseErrorModels.includes(payload.model);
-            if (config.plaintextCollaborationModels.includes(payload.model)) collaboration = createPlaintextCollaboration(payload);
-            if (collaboration) {
-              body = Buffer.from(JSON.stringify(collaboration.payload));
-              metrics.plaintextCollaboration = { enabled: true, restoredCalls: 0 };
-            }
-            if (inspectEarlyError) metrics.earlyResponseError = { enabled: true };
-            if (collaboration || inspectEarlyError) headers['accept-encoding'] = 'identity';
-          }
-        }
         metrics.outputBytes = body.length;
         const outputLimit = Math.floor(config.maxOutputMiB * 1048576);
         if (body.length > outputLimit) throw new ProxyError(413, 'proxy_payload_budget_exceeded',
@@ -285,7 +205,7 @@ export function createProxyServer({ config: overrides = {}, log = () => {}, mana
       upstreamRequest.once('close', clearConnectTimer);
       upstreamRequest.once('error', () => {
         clearConnectTimer();
-        if (signal.aborted || res.destroyed || res.writableEnded || responseHandled || upstreamResponse) return;
+        if (signal.aborted || res.destroyed || res.writableEnded || upstreamResponse) return;
         metrics.error ||= 'proxy_upstream_unavailable';
         if (res.headersSent) { metrics.abortSource ||= 'upstream'; res.destroy(); }
         else {
@@ -306,7 +226,7 @@ export function createProxyServer({ config: overrides = {}, log = () => {}, mana
       }
     } catch (error) {
       if (signal.aborted || res.destroyed) return;
-      const local = error instanceof ProxyError ? error : error instanceof BodyTransformError || error instanceof CollaborationError
+      const local = error instanceof ProxyError ? error : error instanceof BodyTransformError
         ? new ProxyError(error.status, error.code, error.message, error.details)
         : new ProxyError(500, 'proxy_internal_error', '图片代理内部处理失败，请查看元数据日志。');
       metrics.error = local.code;

@@ -11,8 +11,6 @@ export const DEFAULT_CONFIG = Object.freeze({
   sessionIndexPath: null,
   sqliteDbPath: null,
   usageTimezone: '+08:00',
-  plaintextCollaborationModels: Object.freeze([]),
-  earlyResponseErrorModels: Object.freeze([]),
 });
 
 const loopback = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
@@ -25,13 +23,6 @@ export function validateConfig(overrides = {}, { managedUpstream = false, skipUp
     if (!Object.hasOwn(DEFAULT_CONFIG, key)) throw new Error(`Unknown configuration key: ${key}`);
   }
   const config = { ...DEFAULT_CONFIG, ...overrides };
-  const supportedModels = new Set(['gpt-6-astra', 'gpt-6.1-sol']);
-  for (const key of ['plaintextCollaborationModels', 'earlyResponseErrorModels']) {
-    if (!Array.isArray(config[key]) || config[key].some((model) => !supportedModels.has(model))) {
-      throw new Error(`${key} must contain only gpt-6-astra or gpt-6.1-sol model IDs.`);
-    }
-    config[key] = Object.freeze([...new Set(config[key])]);
-  }
   if (!LOG_LEVELS.includes(config.logLevel)) throw new Error(`logLevel must be one of: ${LOG_LEVELS.join(', ')}.`);
   for (const key of ['sessionIndexPath', 'sqliteDbPath']) {
     if (config[key] !== null && (typeof config[key] !== 'string' || !config[key].trim())) {

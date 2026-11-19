@@ -90,9 +90,7 @@ Invoke-RestMethod 'http://127.0.0.1:4142/healthz'
   "logLevel": "info",
   "sessionIndexPath": null,
   "sqliteDbPath": null,
-  "usageTimezone": "+08:00",
-  "plaintextCollaborationModels": [],
-  "earlyResponseErrorModels": []
+  "usageTimezone": "+08:00"
 }
 ```
 
@@ -112,8 +110,8 @@ Invoke-RestMethod 'http://127.0.0.1:4142/healthz'
 | `sessionIndexPath` | Codex 会话标题索引路径；默认 `null`，使用当前用户主目录下的 `.codex/session_index.jsonl`。可指定非空路径字符串，相对路径按代理进程当前目录解析。 |
 | `sqliteDbPath` | 相对日用量及 Today 小时速度的只读 SQLite 路径。默认 `null` 时优先使用 `COPILOT_API_SQLITE_DB_PATH`，否则读取上游 API home 中的 `copilot-api.sqlite`。受管启动使用上游的 `--api-home` 或 `COPILOT_API_HOME`，默认目录为 `~/.local/share/copilot-api`。相对路径按启动时的工作目录解析。 |
 | `usageTimezone` | 相对日的自然日时区，默认 `+08:00`；支持 `Z` 或 `-14:00` 到 `+14:00` 的固定 UTC 偏移（`±HH:mm`），例如 `-05:00`、`+05:30`。不支持地区名或夏令时切换。 |
-| `plaintextCollaborationModels` | 为列表内模型启用 Codex v2 明文协作适配，默认 `[]`。首版仅接受 `gpt-6-astra`、`gpt-6.1-sol`，精确匹配入站 `model`。 |
-| `earlyResponseErrorModels` | 为列表内模型启用初始 SSE 错误检查，默认 `[]`；支持相同两个模型，与明文适配独立。 |
+
+升级时，如果代理的 `config.json` 包含 `plaintextCollaborationModels` 或 `earlyResponseErrorModels`，请删除对应字段。即使值是空数组 `[]`，启动器也会将它识别为未知字段。
 
 **24 MiB 是本项目选择的预算，不是 GitHub 公布的请求限制。** 超限时返回 `413 / proxy_payload_budget_exceeded` 和字节统计，且上游请求次数为零。代理不删图，不继续降低画质。可以提前整理上下文，或显式调整画质和预算。
 
@@ -122,11 +120,11 @@ Invoke-RestMethod 'http://127.0.0.1:4142/healthz'
 - 处理 `POST /responses`、`/responses/compact` 及带 `/v1` 前缀的对应路由。图片位置包括消息 `content[]`、`function_call_output.output[]` 和 `custom_tool_call_output.output[]`。历史里仍携带的旧图也会处理。
 - 不透明静态图转换为 JPEG；真正透明的图保留 PNG；处理方向与色彩空间。动画、多帧、无法处理的图保留原内容。已满足要求且重编码无收益的图保留原数据。
 - 保留图片顺序、文字、工具调用 ID 和其他字段。不下载 HTTP 图片 URL，也不改写 `file_id`。
-- 两项协作兼容配置均为空时，无图片标记且无 Unicode 转义的请求直接通过，不做 JSON 解析；存在 `input_image` 或 `\u` 候选时回退解析，防止转义图片类型漏过。配置了兼容模型列表时，普通 Responses 请求另行解析以匹配模型与工具合同。无图路径仍检查字节预算；无图的畸形 JSON 交给上游验证。
+- 请求体含 `input_image` 或 Unicode 转义标记 `\u` 时，代理解析 JSON 并查找图片。其他请求体通过字节预算检查后原样转发，JSON 格式由上游验证。
 - 图片候选请求的 JSON 与图片处理使用按需创建的单例 worker，避免这些同步计算占用 HTTP 主线程。队列有独立容量上限；worker 的性能实测以验收记录为准。
 - 两级内存缓存分别识别相同 data URL 和相同解码内容，保存最终输出 URL，重复历史图命中时避免再次解码或有损编码。缓存不把原图写到磁盘，缓存容量不等于整个服务的 RSS。
 - 支持解压 zstd、gzip 和 deflate 入站请求，向上游发送普通 JSON 并更新长度、编码相关 headers。`GET /healthz` 由本地处理。Web Dashboard 的会话标题、相对日用量和 Today 小时速度在上游确认访问范围后读取本地数据，`GET /usage-viewer` 按下述条件改写页面，其余路由按字节流透传。
-- 默认 SSE 逐块转发；启用协作兼容时按预算预检或按事件改写，写入仍遵守背压。客户端取消会取消对应上游请求。上游 HTTP 错误透传，每个入站请求最多发出一次上游请求。Codex 自身的重试仍可能产生新的入站请求。
+- Responses 的 HTTP 状态码和响应正文按上游返回值透传，SSE 逐块转发并遵守背压。客户端取消会取消对应上游请求。每个入站请求最多发出一次上游请求。Codex 自身的重试仍可能产生新的入站请求。
 
 ## 用量页面：相对自然日与 Codex 会话标题
 
@@ -175,15 +173,7 @@ Today 显示同样样式的 Output speed (tokens/s) 面板，横轴固定为当�
 
 小时响应提供 24 个 `hours` 桶，每桶包含 `hour`、`start_ms`、`end_ms` 和 `byModel`。页面从当前 endpoint 派生小时接口；覆盖 endpoint 时，目标也须支持该接口。数据库不可读或结构不兼容时返回 501，页面仅在速度面板显示错误，其余用量数据仍可查看。
 
-## Codex v2 明文协作兼容
-
-这是针对 Copilot 原生协作工具兼容问题的绕过，不是对上游加密算法或密钥的修复。明文表示仅涉及 Responses JSON 中的任务文本；远程连接仍沿用原有传输方式。默认关闭，只处理普通 HTTP Responses 路由，不改变 compact 路由，不恢复、省略或迁移未知旧密文。
-
-明文适配将原生 `collaboration` 工具改为普通别名 `codex_collaboration_plaintext`，仅去掉三个消息工具的 `message.encrypted`。返回时恢复原 namespace 并补 `encrypted_function_args: []`，由 Codex 自身构造明文消息。任务正文、调用 ID、模型、思考强度和 v2 调度保持不变。激活后要求 `store=false` 和显式历史回放，不支持 `previous_response_id` / `conversation` 隐式续接。身份、别名或加密元数据冲突明确失败。
-
-早期错误检查独立开启，预算为 2 秒、16 个事件或 256 KiB 初始缓冲阈值；空失败后最多再等 250ms，仍受总期限限制。只将带明确非法请求代码和非空诊断的错误转为 HTTP 400。其他错误按原流行为处理，不猜测、不重试。改写路径单事件上限 8 MiB、非流式 JSON 上限 32 MiB。
-
-[默认配置示例](config.example.json) 保持关闭；[候选配置示例](config.collaboration.example.json) 同时启用两个目标模型。完整合同、错误分类、旧密文限制、手动切换和回退步骤见 [协作兼容说明](docs/collaboration-compatibility.md)。代理结构化日志不记录任务正文、参数、密文或哈希。
+## 日志与重启
 
 代理自身日志只写请求类型、字节数、处理计数、耗时和状态等元数据。默认 `logLevel: "info"` 只输出启动、停止和简短异常：正常请求、健康检查、客户端断开以及完整图片/缓存统计只在 `debug` 级别显示。HTTP 4xx 使用 `warn`，HTTP 5xx、上游流异常和内部错误使用 `error`。`warn` / `error` 可进一步减少日志，`silent` 关闭代理自己的结构化日志。
 
@@ -201,7 +191,7 @@ Today 显示同样样式的 Output speed (tokens/s) 面板，横轴固定为当�
 
 ## 从 v1 迁移、接入与验证
 
-本节的 v1 / v2 指图片代理产品版本；Codex 多代理协议的切换见上面的协作兼容说明。
+本节的 v1 / v2 指图片代理产品版本。
 
 第一次切换到 v2 时，先使用旧版停止方式关闭 v1 的 4142，再停止原先独立运行的 4141。确认两个端口释放后启动 v2；v2 不会自动接管旧进程。之后启动或停止 v2 就同时管理两者。
 
@@ -219,5 +209,7 @@ npm test
 [10 月 3 日](docs/session-replay-20261003.md) 与 [10 月 4 日](docs/session-replay-20261004.md) 的 session replay 调查记录保留为历史资料，其中的旧省略方案不代表当前实现。
 
 ## 验收脚本输入
+
+两个联机脚本 `validate-live.mjs` 和 `validate-tool-roundtrip.mjs` 默认使用 `gpt-6.2-astra`。要验证其他模型，在代理 URL 后传入模型名，例如 `node scripts/validate-live.mjs rollout.jsonl report.json http://127.0.0.1:4142 gpt-6.2-sol`。
 
 `scripts/validate-sample.mjs` 和 `scripts/validate-tool-roundtrip.mjs` 要求 rollout 至少包含 1 张内嵌图片；`scripts/validate-live.mjs` 的追加图片场景要求至少 2 张。脚本只读取 `response_item` 中消息及工具结果的 `input_image`，不重复统计 UI 镜像。样本不足或 JSONL 损坏时立即失败，不发送模型请求；无图片样本不能作为图片代理验收通过的证据。

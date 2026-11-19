@@ -14,7 +14,5 @@
   "logLevel": "info",
   "sessionIndexPath": null,
   "sqliteDbPath": null,
-  "usageTimezone": "+08:00",
-  "plaintextCollaborationModels": [],
-  "earlyResponseErrorModels": []
+  "usageTimezone": "+08:00"
 }

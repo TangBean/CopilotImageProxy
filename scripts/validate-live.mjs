@@ -2,13 +2,13 @@ import { writeFile, mkdir } from 'node:fs/promises';
 import { readImageSample } from './image-sample.mjs';
 import { dirname, resolve } from 'node:path';
 
-const [rollout, reportPath, baseUrl = 'http://127.0.0.1:4142'] = process.argv.slice(2);
+const [rollout, reportPath, baseUrl = 'http://127.0.0.1:4142', model = 'gpt-6.2-astra'] = process.argv.slice(2);
 if (!rollout || !reportPath) {
-  process.stderr.write('Usage: node scripts/validate-live.mjs rollout.jsonl report.json [proxy-url]\n');
+  process.stderr.write('Usage: node scripts/validate-live.mjs rollout.jsonl report.json [proxy-url] [model]\n');
   process.exit(1);
 }
 const { images } = await readImageSample(rollout, 2);
-const report = { startedAt: new Date().toISOString(), model: 'gpt-6-astra', imageCount: images.length, checks: [] };
+const report = { startedAt: new Date().toISOString(), model, imageCount: images.length, checks: [] };
 async function save() {
   await mkdir(dirname(resolve(reportPath)), { recursive: true });
   await writeFile(reportPath, JSON.stringify(report, null, 2) + '\n');

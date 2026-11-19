@@ -36,6 +36,18 @@ test('forwards Responses SSE bytes and upstream accounting headers unchanged', {
   }
 });
 
+test('streams an upstream invalid-request event with its original HTTP status', { timeout: TEST_TIMEOUT }, async (t) => {
+  const failure = 'data: {"type":"response.failed","response":{"error":{"code":"invalid_request_error","message":"fixture"}}}\n\n';
+  const env = await setup(t, { handle: (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(failure);
+  } });
+  const result = await send(env.url, { path: '/v1/responses', body: '{"model":"gpt-6.1-sol","stream":true,"input":[]}' });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.toString(), failure);
+  assert.equal(env.requests.length, 1);
+});
+
 async function listen(server) {
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
@@ -151,11 +163,24 @@ test('healthz identifies the proxy without reaching the upstream', { timeout: TE
   assert.equal(env.requests.length, 0);
 });
 
-test('transforms three typed image containers and preserves every other field', { timeout: TEST_TIMEOUT }, async (t) => {
-  const env = await setup(t);
+test('transforms three typed image containers and preserves native Responses fields and replies', { timeout: TEST_TIMEOUT }, async (t) => {
+  const reply = '{ "output": [{"type":"function_call","namespace":"collaboration","name":"send_message","arguments":"{}","encrypted_function_args":["message"]}] }';
+  const env = await setup(t, { handle: (_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json', etag: '"native-response"' });
+    res.end(reply);
+  } });
   const original = imagePayload(await fixtureImage());
+  original.model = 'gpt-6-astra';
+  original.stream = false;
+  original.tools.push({ type: 'namespace', name: 'collaboration', tools: [{
+    type: 'function', name: 'send_message', parameters: { type: 'object', properties: { message: { type: 'string', encrypted: true } } },
+  }] });
+  original.input.push({ type: 'agent_message', content: [{ type: 'encrypted_content', encrypted_content: 'opaque-fixture' }] });
+  original.include.push('output.encrypted_content');
   const result = await send(env.url, { body: JSON.stringify(original) });
   assert.equal(result.status, 200);
+  assert.equal(result.body.toString(), reply);
+  assert.equal(result.headers.etag, '"native-response"');
   assert.equal(env.requests.length, 1);
   const forwarded = JSON.parse(env.requests[0].body);
   const expected = structuredClone(original);
