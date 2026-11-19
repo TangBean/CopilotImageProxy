@@ -11,5 +11,10 @@
     "build:supervisor": "node scripts/build-supervisor.mjs",
     "test": "node --test test/*.test.mjs"
   },
-  "dependencies": { "sharp": "0.35.4" }
+  "dependencies": {
+    "acorn": "8.19.0",
+    "acorn-walk": "8.3.5",
+    "parse5": "8.1.1",
+    "sharp": "0.35.4"
+  }
 }

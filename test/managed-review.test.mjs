@@ -2,13 +2,16 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { mkdir, mkdtemp, rm, writeFile, copyFile, access } from 'node:fs/promises';
-import { basename, dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, relative, resolve } from 'node:path';
+import net from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
 import { controlRequest } from '../src/control.mjs';
 import { buildSupervisor } from '../scripts/build-supervisor.mjs';
+import { createUpstreamPackageFixture } from './helpers/upstream-package.mjs';
+import { createUsageDb } from './helpers/usage-db.mjs';
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -49,6 +52,77 @@ async function until(check, description) {
   }
   throw new Error(`Timed out: ${description}`);
 }
+
+test('managed usage HTTP requests read the database in the child CLI home', {
+  skip: process.platform !== 'win32', timeout: 20000,
+}, async t => {
+  const f = await createUpstreamPackageFixture(t);
+  const day = 86400000;
+  const midnight = Math.floor(Date.now() / day) * day;
+  async function home(model) {
+    const rows = [midnight - day, midnight].map(created_at_ms => ({
+      created_at_ms, model, input_tokens: 10, output_tokens: 20,
+      request_id: String(created_at_ms), first_token_ms: 500, duration_ms: 1500, request_outcome: 'completed',
+    }));
+    const db = await createUsageDb(t, rows);
+    return dirname(db.path);
+  }
+  const [inheritedHome, cliHome] = await Promise.all([home('inherited-model'), home('cli-model')]);
+  const listeners = [net.createServer(), net.createServer()];
+  let proxyPort, upstreamPort;
+  try {
+    await Promise.all(listeners.map(s => once(s.listen(0, '127.0.0.1'), 'listening')));
+    [proxyPort, upstreamPort] = listeners.map(s => s.address().port);
+  } finally {
+    await Promise.all(listeners.filter(s => s.listening).map(s => new Promise(resolve => s.close(resolve))));
+  }
+  const configPath = join(f.cwd, 'config.json');
+  await writeFile(configPath, JSON.stringify({ port: proxyPort, usageTimezone: 'Z' }));
+  await writeFile(f.binPath, `
+    const http = require('node:http');
+    const range = { start_ms: ${midnight}, end_ms: ${midnight + day} };
+    http.createServer((req, res) => {
+      if (req.url === '/token-usage/events?period=today&page_size=1') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ period: 'today', range, items: [] }));
+      } else {
+        res.writeHead(404);
+        res.end();
+      }
+    }).listen(Number(process.argv.at(-1)), '127.0.0.1');
+  `);
+  const managerPath = buildSupervisor();
+  const spec = { argv: ['start', '--host', '127.0.0.1', '--api-home', relative(f.cwd, cliHome), '--port', String(upstreamPort)],
+    cwd: f.cwd, projectRoot: f.cwd, configPath, explicitConfig: true, managerPath, launcherPid: process.pid, runId: randomUUID() };
+  const env = { ...f.env, USERPROFILE: f.root, HOME: f.root, COPILOT_API_HOME: inheritedHome,
+    CIP_JOB_PIPE: `cip-usage-${randomUUID()}`, CIP_JOB_TOKEN: randomUUID(), CIP_RUN_SPEC: JSON.stringify(spec) };
+  for (const key of Object.keys(env)) {
+    if (key.toUpperCase() === 'COPILOT_API_SQLITE_DB_PATH') delete env[key];
+  }
+  const manager = spawn(managerPath, ['--parent-pid', String(process.pid), '--node', process.execPath, '--entry', join(projectRoot, 'src', 'managed.mjs')], {
+    cwd: f.cwd, env, windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'],
+  });
+  let diagnostics = '';
+  manager.stderr.on('data', chunk => { diagnostics += chunk; });
+  const exited = once(manager, 'exit');
+  try {
+    await until(() => {
+      if (manager.exitCode !== null) throw new Error(`Fixture startup failed: ${diagnostics}`);
+      return diagnostics.includes('"event":"ready"');
+    }, 'managed usage fixture is ready');
+    const read = async route => {
+      const response = await fetch(`http://127.0.0.1:${proxyPort}${route}`);
+      assert.equal(response.status, 200);
+      return response.json();
+    };
+    const [daily, hourly] = await Promise.all([read('/token-usage?period=-1d'), read('/token-usage/hourly?period=today')]);
+    assert.deepEqual(daily.byModel.map(row => row.model), ['cli-model']);
+    assert.deepEqual(hourly.hours[0].byModel, [{ model: 'cli-model', output_tokens_per_second: 20 }]);
+  } finally {
+    if (manager.exitCode === null && manager.signalCode === null) manager.kill('SIGKILL');
+    await exited;
+  }
+});
 
 test('stop script safely reclaims its verified JobHost when control authentication fails', {
   skip: process.platform !== 'win32', timeout: 20000,

@@ -583,7 +583,18 @@ async function sessionIndexFixture(t, contents) {
   return path;
 }
 
-test('session titles use the latest timestamp and skip corrupt records without reaching upstream', { timeout: TEST_TIMEOUT }, async (t) => {
+const titleScopePath = '/token-usage/events?period=today&page_size=1';
+
+function setupSessionTitles(t, sessionIndexPath) {
+  return setup(t, { config: { sessionIndexPath }, handle: (req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(req.url === titleScopePath
+      ? JSON.stringify({ period: 'today', range: { start_ms: 0, end_ms: 100 }, items: [] })
+      : '{"ok":true}');
+  } });
+}
+
+test('session titles use the latest timestamp and skip corrupt records after upstream authentication', { timeout: TEST_TIMEOUT }, async (t) => {
   const rows = [
     { id: 'thread-1', thread_name: '最新中文标题', updated_at: '2026-10-31T10:00:00Z' },
     { id: 'thread-1', thread_name: 'older last line', updated_at: '2026-10-30T10:00:00Z' },
@@ -595,15 +606,16 @@ test('session titles use the latest timestamp and skip corrupt records without r
     null,
   ];
   const sessionIndexPath = await sessionIndexFixture(t, rows.map((row) => JSON.stringify(row)).join('\n') + '\n{broken\n');
-  const env = await setup(t, { config: { sessionIndexPath } });
-  const result = await send(env.url, { method: 'GET', path: '/__session-titles?refresh=1' });
+  const env = await setupSessionTitles(t, sessionIndexPath);
+  const result = await send(env.url, { method: 'GET', path: '/__session-titles?refresh=1', headers: { authorization: 'Bearer fixture-title-key' } });
   assert.equal(result.status, 200);
   assert.match(result.headers['content-type'], /^application\/json/);
   assert.equal(result.headers['cache-control'], 'no-store');
   assert.deepEqual(JSON.parse(result.body), {
     'thread-1': '最新中文标题', 'thread-2': 'preserve whitespace ', ['__proto__']: 'ordinary ID',
   });
-  assert.equal(env.requests.length, 0);
+  assert.deepEqual(env.requests.map((req) => req.url), [titleScopePath]);
+  assert.equal(env.requests[0].headers.authorization, 'Bearer fixture-title-key');
 });
 
 test('session title cache refreshes on mtime or size changes', { timeout: TEST_TIMEOUT }, async (t) => {
@@ -612,7 +624,7 @@ test('session title cache refreshes on mtime or size changes', { timeout: TEST_T
   const firstTime = new Date('2026-10-31T10:00:00Z');
   const nextTime = new Date('2026-10-31T10:01:00Z');
   await utimes(sessionIndexPath, firstTime, firstTime);
-  const env = await setup(t, { config: { sessionIndexPath } });
+  const env = await setupSessionTitles(t, sessionIndexPath);
   const read = async () => JSON.parse((await send(env.url, { method: 'GET', path: '/__session-titles' })).body);
   assert.deepEqual(await read(), { thread: 'before' });
   await writeFile(sessionIndexPath, contents('after!'));
@@ -623,12 +635,12 @@ test('session title cache refreshes on mtime or size changes', { timeout: TEST_T
   await writeFile(sessionIndexPath, contents('longer title'));
   await utimes(sessionIndexPath, nextTime, nextTime);
   assert.deepEqual(await read(), { thread: 'longer title' });
-  assert.equal(env.requests.length, 0);
+  assert.deepEqual(env.requests.map((req) => req.url), Array(4).fill(titleScopePath));
 });
 
 test('missing or unreadable session indexes return empty mappings and recover without affecting other routes', { timeout: TEST_TIMEOUT }, async (t) => {
   const sessionIndexPath = await sessionIndexFixture(t);
-  const env = await setup(t, { config: { sessionIndexPath } });
+  const env = await setupSessionTitles(t, sessionIndexPath);
   const read = async () => {
     const result = await send(env.url, { method: 'GET', path: '/__session-titles' });
     assert.equal(result.status, 200);
@@ -642,13 +654,13 @@ test('missing or unreadable session indexes return empty mappings and recover wi
   assert.deepEqual(await read(), { thread: 'recovered' });
   await unlink(sessionIndexPath);
   assert.deepEqual(await read(), {});
-  assert.equal(env.requests.length, 0);
+  assert.deepEqual(env.requests.map((req) => req.url), Array(4).fill(titleScopePath));
   const ordinary = await send(env.url, { method: 'GET', path: '/token-usage/sessions?period=week' });
   assert.deepEqual(JSON.parse(ordinary.body), { ok: true });
-  assert.equal(env.requests.length, 1);
+  assert.equal(env.requests.length, 5);
 });
 
-const usageViewerHtml = await readFile(new URL('./fixtures/usage-viewer.upstream.html', import.meta.url), 'utf8');
+const usageViewerHtml = await readFile(new URL('./fixtures/usage-viewer.v2.9.15.html', import.meta.url), 'utf8');
 const viewerValidators = {
   etag: '"upstream-html"', 'content-md5': 'upstream-md5', digest: 'sha-256=upstream-digest',
   'content-digest': 'sha-256=:upstream-digest:', 'repr-digest': 'sha-256=:upstream-digest:',
@@ -667,7 +679,7 @@ test('usage viewer preserves non-UTF-8 bytes outside its ASCII edits', { timeout
   assert.equal(result.headers['content-type'], 'text/html; charset=iso-8859-1');
   assert.ok(result.body.includes(Buffer.from('caf\u00e9', 'latin1')));
   assert.ok(result.body.includes('http://127.0.0.1:18042/usage'));
-  assert.ok(result.body.includes('MutationObserver'));
+  assert.ok(result.body.includes('/__session-titles'));
   assert.equal(Number(result.headers['content-length']), result.body.length);
   assert.deepEqual(result.body.subarray(0, result.body.indexOf('<script>')), bytes.subarray(0, bytes.indexOf('<script>')));
   assert.deepEqual(result.body.subarray(result.body.lastIndexOf('</body>')), bytes.subarray(bytes.lastIndexOf('</body>')));
@@ -689,12 +701,10 @@ test('usage viewer rewrites the configured origin and injects a static script wi
     const html = result.body.toString();
     const originHost = host === '::1' ? '[::1]' : host;
     assert.equal(result.status, 200);
-    assert.ok(html.includes(`const DEFAULT_ENDPOINT = "http://${originHost}:18042/usage";`));
+    assert.ok(html.includes(`"http://${originHost}:18042/usage"`));
     assert.ok(!html.includes('const DEFAULT_ENDPOINT = "http://localhost:4141/usage";'));
     assert.ok(!html.includes('TITLE_MUST_NOT_BE_EMBEDDED'));
-    assert.match(html, /fetch\(['"]\/__session-titles['"]\)/);
-    assert.match(html, /MutationObserver/);
-    assert.ok(html.indexOf('MutationObserver') < html.lastIndexOf('</body>'));
+    assert.ok(html.includes('/__session-titles'));
     assert.equal(Number(result.headers['content-length']), result.body.length);
     assert.notEqual(result.body.length, html.length, 'UTF-8 length must count bytes');
     assert.equal(result.headers['content-type'], 'text/html; charset=UTF-8');
@@ -753,18 +763,13 @@ test('relative-day viewer rejects incompatible successful responses instead of s
   }
 });
 
-test('usage viewer reports incompatible HTML markers instead of returning an unpatched Today page', { timeout: TEST_TIMEOUT }, async (t) => {
+test('usage viewer returns 502 for missing dashboard integration points', { timeout: TEST_TIMEOUT }, async (t) => {
   const cases = [
     usageViewerHtml.replace('const DEFAULT_ENDPOINT', 'const CHANGED_ENDPOINT'),
-    usageViewerHtml.replace('</body>', ''),
     usageViewerHtml.replace('function normalizePeriod(', 'function changedNormalizePeriod('),
-    usageViewerHtml.replace('</body>', '</body></body>'),
     usageViewerHtml.replace('function renderTokenUsageDailyTrend(', 'function changedDailyTrend('),
-    usageViewerHtml + '\nfunction renderTokenUsageDailyTrend(dailySummary, error) {',
     usageViewerHtml.replace('${renderTokenUsageDailyTrend(', '${changedDailyTrend('),
-    usageViewerHtml + '\n${renderTokenUsageDailyTrend(\n                dailySummary,\n                state.tokenUsageDailyError\n              )}',
     usageViewerHtml.replace('function getCostAmount(', 'function changedCostAmount('),
-    usageViewerHtml + '\nfunction getCostAmount(cost) {',
   ];
   for (const body of cases) {
     const env = await setup(t, { handle: (_req, res) => {

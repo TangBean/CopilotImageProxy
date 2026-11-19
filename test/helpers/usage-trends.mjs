@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 import { usageTrendScript } from '../../src/usage-trends.mjs';
 
-const upstream = readFileSync(new URL('../fixtures/usage-viewer.upstream.html', import.meta.url), 'utf8');
+const upstream = readFileSync(new URL('../fixtures/usage-viewer.v2.9.15.html', import.meta.url), 'utf8');
 const helpers = [
   'escapeHtml', 'getCostAmount', 'formatChartDate', 'formatRangeDate', 'formatRangeText',
   'renderTokenUsageRangeText', 'renderEmptyState', 'renderError',

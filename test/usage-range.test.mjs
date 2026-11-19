@@ -1,12 +1,13 @@
 import assert from 'node:assert/strict';
 import { access, readFile, writeFile } from 'node:fs/promises';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import {
-  createRelativeDayRange, createUsageRangeReader, parseRelativeDayPeriod, UsageRangeError,
+  createRelativeDayRange, createUsageHourlyReader, createUsageRangeReader, parseRelativeDayPeriod, UsageRangeError,
 } from '../src/usage-range.mjs';
+import { resolveUsageDatabasePath } from '../src/usage-db-path.mjs';
 import { createUsageDb } from './helpers/usage-db.mjs';
 
 const DAY = 86400000;
@@ -498,15 +499,35 @@ test('one read-only transaction provides a stable snapshot and closes after succ
   assert.equal((await after('/token-usage', query())).totals.total_tokens, 30);
 });
 
+test('database path policy respects overrides, the caller directory and SQLite filenames', () => {
+  const cwd = join(tmpdir(), 'copilot caller');
+  const env = { COPILOT_API_HOME: 'inherited' };
+  assert.equal(resolveUsageDatabasePath({ cwd, env }), join(cwd, 'inherited', 'copilot-api.sqlite'));
+  assert.equal(resolveUsageDatabasePath({ cwd, env, apiHome: 'selected' }), join(cwd, 'selected', 'copilot-api.sqlite'));
+  assert.equal(resolveUsageDatabasePath({ cwd, env, apiHome: '' }), join(homedir(), '.local', 'share', 'copilot-api', 'copilot-api.sqlite'));
+  env.COPILOT_API_SQLITE_DB_PATH = 'from-env.sqlite';
+  assert.equal(resolveUsageDatabasePath({ cwd, env, apiHome: 'selected' }), join(cwd, 'from-env.sqlite'));
+  assert.equal(resolveUsageDatabasePath({ cwd, env, sqliteDbPath: 'explicit.sqlite' }), join(cwd, 'explicit.sqlite'));
+  for (const [value, expected] of [['', ':memory:'], [':memory:', ':memory:'], ['file::memory:', 'file::memory:']]) {
+    assert.equal(resolveUsageDatabasePath({ cwd, env: { ...env, COPILOT_API_SQLITE_DB_PATH: value } }), expected);
+  }
+});
+
 test('database path override precedes the lazily resolved environment and default path', async (t) => {
   const first = await createUsageDb(t, [{ created_at_ms: start, total_tokens: 10 }]);
-  const second = await createUsageDb(t, [{ created_at_ms: start, total_tokens: 20 }]);
+  const second = await createUsageDb(t, [{ created_at_ms: start, total_tokens: 20, model: 'second-model' }]);
   const previous = process.env.COPILOT_API_SQLITE_DB_PATH;
+  const previousHome = process.env.COPILOT_API_HOME;
   t.after(() => {
     if (previous === undefined) delete process.env.COPILOT_API_SQLITE_DB_PATH;
     else process.env.COPILOT_API_SQLITE_DB_PATH = previous;
+    if (previousHome === undefined) delete process.env.COPILOT_API_HOME;
+    else process.env.COPILOT_API_HOME = previousHome;
   });
   const lazy = createUsageRangeReader({}, { now: () => now });
+  const hourly = createUsageHourlyReader();
+  const hourlyRange = { start_ms: start, end_ms: end };
+  process.env.COPILOT_API_HOME = dirname(first.path);
   process.env.COPILOT_API_SQLITE_DB_PATH = first.path;
   assert.equal((await lazy('/token-usage', query())).totals.total_tokens, 10);
   process.env.COPILOT_API_SQLITE_DB_PATH = second.path;
@@ -514,6 +535,12 @@ test('database path override precedes the lazily resolved environment and defaul
   const explicit = createUsageRangeReader({ sqliteDbPath: first.path }, { now: () => now });
   assert.equal((await explicit('/token-usage', query())).totals.total_tokens, 10);
   delete process.env.COPILOT_API_SQLITE_DB_PATH;
+  assert.equal((await lazy('/token-usage', query())).totals.total_tokens, 10);
+  assert.deepEqual((await hourly(hourlyRange)).byModel, [{ model: 'model-a' }]);
+  process.env.COPILOT_API_HOME = dirname(second.path);
+  assert.equal((await lazy('/token-usage', query())).totals.total_tokens, 20);
+  assert.deepEqual((await hourly(hourlyRange)).byModel, [{ model: 'second-model' }]);
+  delete process.env.COPILOT_API_HOME;
   let attemptedPath;
   const defaultPath = createUsageRangeReader({}, {
     now: () => now,

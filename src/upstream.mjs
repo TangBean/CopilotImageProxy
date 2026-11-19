@@ -40,25 +40,23 @@ export function classifyCopilotArgs(argv) {
 // Mirrors the relevant citty 0.1.6 / mri behavior without changing argv. Repeated
 // string options produce arrays; aliases are synchronized in insertion order.
 // copilot-api applies parseInt to the resulting port, so the first value wins.
-function bindingOptions(argv) {
+function cliOptions(argv, startIndex = 0) {
   const values = new Map();
+  const keys = ['host', 'port', 'p', 'api-home', 'apiHome'];
   const add = (key, value) => {
-    if (!['host', 'port', 'p'].includes(key)) return;
+    if (!keys.includes(key)) return;
     const normalized = value === undefined || value === true ? '' : String(value);
     if (!values.has(key)) values.set(key, normalized);
     else values.set(key, Array.isArray(values.get(key)) ? [...values.get(key), normalized] : [values.get(key), normalized]);
   };
-  // Upstream passes only tokens AFTER the selected command to the start parser;
-  // a leading --port=... is a root option and does not set the server port.
-  const start = commandIndex(argv);
-  for (let index = start < 0 ? argv.length : start + 1; index < argv.length; index += 1) {
+  for (let index = startIndex; index < argv.length; index += 1) {
     const token = argv[index];
     if (token === '--') break;
     const dashCount = /^-*/.exec(token)[0].length;
     if (dashCount === 0) continue;
     if (token.slice(dashCount, dashCount + 3) === 'no-') {
       const key = token.slice(dashCount + 3);
-      if (['host', 'port', 'p'].includes(key)) values.set(key, false);
+      if (keys.includes(key)) values.set(key, false);
       continue;
     }
     let equals = token.indexOf('=', dashCount + 1);
@@ -72,21 +70,23 @@ function bindingOptions(argv) {
     const names = dashCount === 2 ? [name] : [...name];
     for (let part = 0; part < names.length; part += 1) add(names[part], part + 1 < names.length || value);
   }
-  const firstPortKey = [...values.keys()].find((key) => key === 'port' || key === 'p');
-  return { host: values.get('host'), port: firstPortKey === undefined ? '4141' : values.get(firstPortKey) };
+  return values;
 }
 
 export function resolveBinding(argv, env = process.env) {
   checkArgv(argv);
-  const parsed = bindingOptions(argv);
-  let host = parsed.host === undefined ? (env.HOST?.trim() || '127.0.0.1') : parsed.host;
+  // The start command receives only the options following the command name.
+  const start = commandIndex(argv);
+  const options = cliOptions(argv, start < 0 ? argv.length : start + 1);
+  let host = options.get('host') ?? (env.HOST?.trim() || '127.0.0.1');
   if (typeof host !== 'string') {
     throw failure('UPSTREAM_INVALID_BINDING', 'The host option must have one string value; repeated --host is not supported by copilot-api.');
   }
   host = host.trim();
   if (host.startsWith('[') && host.endsWith(']')) host = host.slice(1, -1);
   if (!host || /[\s/?#]/.test(host)) throw failure('UPSTREAM_INVALID_BINDING', 'Invalid copilot-api host option.');
-  const port = Number.parseInt(parsed.port, 10);
+  const firstPortKey = [...options.keys()].find((key) => key === 'port' || key === 'p');
+  const port = Number.parseInt(options.get(firstPortKey) ?? '4141', 10);
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     throw failure('UPSTREAM_INVALID_BINDING', 'The effective copilot-api port must be between 1 and 65535. Use --port VALUE or -p VALUE.');
   }
@@ -94,6 +94,15 @@ export function resolveBinding(argv, env = process.env) {
   // IPv4 loopback; its IPv6 wildcard socket is dual-stack by default.
   const connectHost = host === '0.0.0.0' || host === '::' ? '127.0.0.1' : host.toLowerCase();
   return { host, port, connectHost };
+}
+
+export function parseApiHomeOption(argv) {
+  // copilot-api parses global flags across the entire argv before loading its paths.
+  const options = cliOptions(argv);
+  const camel = options.get('apiHome');
+  // citty also looks up the undeclared camelCase spelling, with numeric coercion.
+  const cliHome = options.get('api-home') ?? (typeof camel === 'string' && !Number.isFinite(Number(camel)) ? camel : undefined);
+  return typeof cliHome === 'string' ? cliHome : undefined;
 }
 
 async function resolveNpmCli(nodePath, env) {

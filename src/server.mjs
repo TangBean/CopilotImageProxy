@@ -8,14 +8,11 @@ import { validateConfig } from './config.mjs';
 import { VERSION } from './version.mjs';
 import { createPlaintextCollaboration, CollaborationError } from './collaboration-plaintext.mjs';
 import { adaptSse, preflightSse, readJsonResponse, writeStream, ResponseStreamError, MAX_JSON_RESPONSE_BYTES } from './responses-stream.mjs';
-import { createSessionTitleReader } from './session-titles.mjs';
-import { rewriteUsageViewer, UsageViewerError } from './usage-viewer.mjs';
-import { createRelativeDayRange, createUsageHourlyReader, createUsageRangeReader, parseRelativeDayPeriod, UsageRangeError } from './usage-range.mjs';
+import { createUsageRouter, usageErrorReply } from './usage-routes.mjs';
 
 const decompressors = { zstd: promisify(zstdDecompress), gzip: promisify(gunzip), deflate: promisify(inflate) };
 const transformedRoutes = new Set(['/responses', '/responses/compact', '/v1/responses', '/v1/responses/compact']);
 const compatibilityRoutes = new Set(['/responses', '/v1/responses']);
-const usageRangeRoutes = new Set(['/token-usage', '/token-usage/daily', '/token-usage/events', '/token-usage/sessions', '/token-usage/hourly']);
 const imageMarker = Buffer.from('input_image');
 const unicodeEscapeMarker = Buffer.from([0x5c, 0x75]);
 const hopHeaders = new Set(['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
@@ -31,18 +28,6 @@ function headersWithoutHopByHop(headers) {
   const excluded = new Set(hopHeaders);
   for (const name of String(headers.connection || '').split(',')) excluded.add(name.trim().toLowerCase());
   return Object.fromEntries(Object.entries(headers).filter(([name]) => !excluded.has(name.toLowerCase())));
-}
-
-function usageCorsHeaders(origin) {
-  const headers = { vary: 'Origin' };
-  try {
-    const url = new URL(origin);
-    if (url.origin === origin && ['http:', 'https:'].includes(url.protocol) &&
-        ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)) {
-      headers['access-control-allow-origin'] = origin;
-    }
-  } catch { /* Requests without a valid Origin do not need CORS permission. */ }
-  return headers;
 }
 
 function readBody(req, limit, signal) {
@@ -82,9 +67,7 @@ async function decodeBody(raw, encoding, limit) {
 
 export function createProxyServer({ config: overrides = {}, log = () => {}, managedUpstream = false, useWorker = true } = {}) {
   const config = validateConfig(overrides, { managedUpstream });
-  const readSessionTitles = createSessionTitleReader(config.sessionIndexPath);
-  const readUsageRange = createUsageRangeReader(config);
-  const readUsageHourly = createUsageHourlyReader(config);
+  const prepareUsageRequest = createUsageRouter(config);
   const upstreamBase = new URL(config.upstream);
   const transformer = createBodyTransformer({ config, useWorker });
   const agents = { 'http:': new http.Agent({ keepAlive: true }), 'https:': new https.Agent({ keepAlive: true }) };
@@ -96,11 +79,9 @@ export function createProxyServer({ config: overrides = {}, log = () => {}, mana
     const controller = new AbortController();
     const { signal } = controller;
     let upstreamRequest; let upstreamResponse;
+    let dashboard;
     let collaboration;
     let inspectEarlyError = false;
-    let usageViewer = false;
-    let usageHourly = false;
-    let relativeUsageViewer = false;
     let responseHandled = false;
     const metrics = { requestId, method: req.method, upstreamRequests: 0 };
     let logged = false;
@@ -126,61 +107,43 @@ export function createProxyServer({ config: overrides = {}, log = () => {}, mana
     req.once('aborted', abort);
     res.once('close', () => { if (!res.writableFinished) abort(); finishLog(); });
     res.once('finish', finishLog);
+    const sendReply = (reply) => {
+      if (reply.error) metrics.error = reply.error;
+      res.writeHead(reply.status, reply.headers);
+      res.end(reply.body);
+    };
     const failResponse = (error) => {
       if (signal.aborted || res.destroyed || res.writableEnded) return;
-      const local = error instanceof CollaborationError || error instanceof ResponseStreamError || error instanceof UsageViewerError || error instanceof UsageRangeError ? error
-        : new ResponseStreamError('proxy_upstream_stream_error', '无法读取完整上游响应。');
-      metrics.error = local.code ?? local.type;
-      metrics.abortSource = local === error ? 'proxy' : 'upstream';
+      const reply = error instanceof CollaborationError || error instanceof ResponseStreamError
+        ? { status: error.status, error: error.code, headers: { 'content-type': 'application/json; charset=utf-8' },
+          body: JSON.stringify({ error: { code: error.code, message: error.message } }) }
+        : usageErrorReply(error, dashboard?.headers);
+      metrics.error = reply?.error ?? 'proxy_upstream_stream_error';
+      metrics.abortSource = reply ? 'proxy' : 'upstream';
       responseHandled = true;
-      controller.abort(local);
+      controller.abort(error);
       if (res.headersSent) res.destroy();
       else {
-        res.writeHead(local.status, { 'content-type': 'application/json; charset=utf-8', connection: 'close',
-          ...(usageHourly ? { ...usageCorsHeaders(req.headers.origin), 'cache-control': 'no-store' } : {}) });
-        res.end(JSON.stringify({ error: { ...(local.type ? { type: local.type } : { code: local.code }), message: local.message } }));
+        res.setHeader('connection', 'close');
+        sendReply(reply ?? {
+          status: 502, headers: { 'content-type': 'application/json; charset=utf-8', ...dashboard?.headers },
+          body: JSON.stringify({ error: { code: metrics.error, message: '无法读取完整上游响应。' } }),
+        });
       }
       upstreamResponse?.destroy(); upstreamRequest?.destroy();
     };
-
     const handleResponse = async (incoming) => {
       const headers = headersWithoutHopByHop(incoming.headers);
+      if (dashboard) {
+        const reply = await dashboard.readResponse(incoming, headers, signal);
+        if (reply) {
+          sendReply(reply);
+          return;
+        }
+      }
       const success = incoming.statusCode >= 200 && incoming.statusCode < 300;
       const type = String(incoming.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
       const encoding = String(incoming.headers['content-encoding'] || '').trim().toLowerCase();
-      if (usageHourly) Object.assign(headers, usageCorsHeaders(req.headers.origin), { 'cache-control': 'no-store' });
-      if (usageHourly && success) {
-        if (incoming.statusCode !== 200 || !/(?:\/|\+)json$/.test(type) || (encoding && encoding !== 'identity')) {
-          throw new UsageRangeError(502, 'usage_hourly_unavailable', 'Hourly usage requires an uncompressed 200 JSON Today response.');
-        }
-        const daily = await readJsonResponse(incoming, { signal });
-        const usage = await readUsageHourly(daily.range);
-        signal.throwIfAborted();
-        metrics.route = '/token-usage/hourly';
-        responseHandled = true;
-        res.writeHead(200, { ...usageCorsHeaders(req.headers.origin),
-          'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
-        res.end(JSON.stringify(usage));
-        return;
-      }
-      if (relativeUsageViewer && success &&
-          (incoming.statusCode !== 200 || type !== 'text/html' || (encoding && encoding !== 'identity'))) {
-        throw new UsageViewerError('Upstream usage viewer is incompatible: relative-day periods require an uncompressed 200 HTML response.');
-      }
-      if (usageViewer && incoming.statusCode === 200 && type === 'text/html' && (!encoding || encoding === 'identity')) {
-        const chunks = [];
-        for await (const chunk of incoming) chunks.push(chunk);
-        signal.throwIfAborted();
-        const original = Buffer.concat(chunks);
-        const rewritten = rewriteUsageViewer(original, config);
-        if (rewritten) {
-          for (const name of ['content-length', 'content-encoding', 'content-md5', 'digest', 'content-digest', 'repr-digest', 'etag', 'last-modified']) delete headers[name];
-          headers['content-length'] = String(rewritten.length);
-        }
-        responseHandled = true;
-        res.writeHead(incoming.statusCode, headers); res.end(rewritten ?? original);
-        return;
-      }
       const sse = type === 'text/event-stream';
       const needsRead = success && (collaboration || (inspectEarlyError && sse));
       if (!needsRead) {
@@ -241,43 +204,12 @@ export function createProxyServer({ config: overrides = {}, log = () => {}, mana
       if (!req.url?.startsWith('/')) throw new ProxyError(400, 'proxy_invalid_target', '请求路径必须使用 origin form。');
       const route = req.url.split('?')[0];
       metrics.route = transformedRoutes.has(route) || route === '/healthz' ? route : 'passthrough';
-      if (usageRangeRoutes.has(route) || route === '/usage-viewer') {
-        const params = new URL(req.url, 'http://localhost').searchParams;
-        if (params.has('from') || params.has('to')) {
-          throw new UsageRangeError(400, 'invalid_request_error', 'Use period=-Nd or -Nday; explicit date boundaries are not supported.');
-        }
-        if (params.getAll('period').length > 1) {
-          throw new UsageRangeError(400, 'invalid_request_error', 'Specify period only once.');
-        }
-        usageHourly = route === '/token-usage/hourly';
-        if (usageHourly && params.has('period') && params.get('period') !== 'today') {
-          throw new UsageRangeError(400, 'invalid_request_error', 'Hourly usage supports period=today only.');
-        }
-        const relativePeriod = parseRelativeDayPeriod(params.get('period'));
-        relativeUsageViewer = req.method === 'GET' && route === '/usage-viewer' && relativePeriod !== null;
-        if (relativeUsageViewer) createRelativeDayRange(relativePeriod, config.usageTimezone);
-        if (req.method === 'OPTIONS' && usageRangeRoutes.has(route) && (relativePeriod !== null || usageHourly)) {
-          res.writeHead(204, {
-            ...usageCorsHeaders(req.headers.origin), 'cache-control': 'no-store',
-            'access-control-allow-methods': 'GET',
-            'access-control-allow-headers': 'content-type, authorization, x-api-key',
-          });
-          res.end();
+      dashboard = prepareUsageRequest(req, route);
+      if (dashboard) {
+        metrics.route = route;
+        if (dashboard.reply) {
+          sendReply(dashboard.reply);
           return;
-        }
-        if (usageHourly && req.method !== 'GET') {
-          throw new UsageRangeError(405, 'invalid_request_error', 'Hourly usage supports GET only.');
-        }
-        if (req.method === 'GET' && usageRangeRoutes.has(route) && !usageHourly) {
-          const usage = await readUsageRange(route, params);
-          if (usage !== null) {
-            if (signal.aborted) return;
-            metrics.route = route;
-            res.writeHead(200, { ...usageCorsHeaders(req.headers.origin),
-              'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
-            res.end(JSON.stringify(usage));
-            return;
-          }
         }
       }
       if (req.method === 'GET' && route === '/healthz') {
@@ -285,18 +217,10 @@ export function createProxyServer({ config: overrides = {}, log = () => {}, mana
         res.end(JSON.stringify({ service: 'copilot-image-proxy', status: 'ok', pid: process.pid, version: VERSION }));
         return;
       }
-      if (req.method === 'GET' && route === '/__session-titles') {
-        const titles = await readSessionTitles();
-        if (signal.aborted) return;
-        res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
-        res.end(JSON.stringify(titles));
-        return;
-      }
-      usageViewer = req.method === 'GET' && route === '/usage-viewer';
       let body;
       const headers = headersWithoutHopByHop(req.headers);
       delete headers.host;
-      if (usageViewer || usageHourly) headers['accept-encoding'] = 'identity';
+      if (dashboard) headers['accept-encoding'] = 'identity';
       if (req.method === 'POST' && transformedRoutes.has(route)) {
         const inputLimit = Math.floor(config.maxInputMiB * 1048576);
         const raw = await readBody(req, inputLimit, signal);
@@ -343,7 +267,7 @@ export function createProxyServer({ config: overrides = {}, log = () => {}, mana
       }
       signal.throwIfAborted();
       const transport = upstreamBase.protocol === 'https:' ? https : http;
-      const upstreamPath = upstreamBase.pathname.replace(/\/$/, '') + (usageHourly ? '/token-usage/daily?period=today' : req.url);
+      const upstreamPath = upstreamBase.pathname.replace(/\/$/, '') + (dashboard?.upstreamPath ?? req.url);
       upstreamRequest = transport.request(upstreamBase, { method: req.method, path: upstreamPath,
         headers, agent: agents[upstreamBase.protocol] });
       metrics.upstreamRequests = 1;
@@ -366,7 +290,7 @@ export function createProxyServer({ config: overrides = {}, log = () => {}, mana
         if (res.headersSent) { metrics.abortSource ||= 'upstream'; res.destroy(); }
         else {
           res.writeHead(502, { 'content-type': 'application/json; charset=utf-8',
-            ...(usageHourly ? { ...usageCorsHeaders(req.headers.origin), 'cache-control': 'no-store' } : {}) });
+            ...dashboard?.headers });
           res.end(JSON.stringify({ error: { code: metrics.error, message: '无法连接或读取原 copilot-api，请检查其运行状态。' } }));
         }
       });
@@ -382,13 +306,6 @@ export function createProxyServer({ config: overrides = {}, log = () => {}, mana
       }
     } catch (error) {
       if (signal.aborted || res.destroyed) return;
-      if (error instanceof UsageRangeError) {
-        metrics.error = error.type;
-        res.writeHead(error.status, { ...usageCorsHeaders(req.headers.origin),
-          'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
-        res.end(JSON.stringify({ error: { type: error.type, message: error.message } }));
-        return;
-      }
       const local = error instanceof ProxyError ? error : error instanceof BodyTransformError || error instanceof CollaborationError
         ? new ProxyError(error.status, error.code, error.message, error.details)
         : new ProxyError(500, 'proxy_internal_error', '图片代理内部处理失败，请查看元数据日志。');

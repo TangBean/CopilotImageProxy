@@ -6,7 +6,8 @@ import { once } from 'node:events';
 import net from 'node:net';
 import http from 'node:http';
 import { loadConfig, validateConfig } from './config.mjs';
-import { classifyCopilotArgs, resolveBinding, resolveLatestPackage } from './upstream.mjs';
+import { classifyCopilotArgs, parseApiHomeOption, resolveBinding, resolveLatestPackage } from './upstream.mjs';
+import { resolveUsageDatabasePath } from './usage-db-path.mjs';
 import { controlRequest, pipePath } from './control.mjs';
 import { VERSION } from './version.mjs';
 import { launchContextDigest } from './launch-context.mjs';
@@ -133,12 +134,12 @@ async function saveState() {
 }
 
 async function run() {
-  let config;
+  let config, binding;
   if (mode.managed) {
     config = loadConfig(spec.configPath, { allowMissing: !spec.explicitConfig, managedStart: true });
     log = createLogger({ level: config.logLevel });
     await takeLock(resolve(spec.projectRoot, '.run'));
-    const binding = resolveBinding(spec.argv, process.env);
+    binding = resolveBinding(spec.argv, process.env);
     if (config.port === binding.port) throw new Error('Proxy and copilot-api cannot share the same port.');
     await canBind(config.host, config.port); await canBind(binding.host, binding.port);
     process.on('SIGINT', () => shutdown(0)); process.on('SIGTERM', () => shutdown(0)); process.on('SIGBREAK', () => shutdown(0));
@@ -172,11 +173,13 @@ async function run() {
   });
   exitPromise.catch(() => {});
   if (!mode.managed) { process.exitCode = await exitPromise; return; }
-  const binding = resolveBinding(spec.argv, env);
   const upstream = await Promise.race([waitForUpstream(binding, config), exitPromise.then((code) => {
     throw new Error(`copilot-api exited before startup completed (code ${code}).`);
   })]);
-  config = validateConfig({ ...config, upstream }, { managedUpstream: true });
+  const sqliteDbPath = resolveUsageDatabasePath({
+    sqliteDbPath: config.sqliteDbPath, apiHome: parseApiHomeOption(spec.argv), cwd: spec.cwd,
+  });
+  config = validateConfig({ ...config, upstream, sqliteDbPath }, { managedUpstream: true });
   const { createProxyServer } = await import('./server.mjs');
   server = createProxyServer({ config, log, managedUpstream: true });
   server.listen(config.port, config.host); await once(server, 'listening');

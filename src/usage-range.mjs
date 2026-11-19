@@ -1,5 +1,4 @@
-import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { resolveUsageDatabasePath } from './usage-db-path.mjs';
 
 const DAY_MS = 86400000;
 const HOUR_MS = 3600000;
@@ -44,8 +43,15 @@ function offsetMinutes(value) {
 }
 
 export function createRelativeDayRange(period, timezone = '+08:00', now = Date.now()) {
+  const range = resolveRelativeDayRange(period, timezone, () => now);
+  if (range === null) throw invalid('A relative-day period of -Nd or -Nday is required.');
+  return range;
+}
+
+export function resolveRelativeDayRange(period, timezone, clock = Date.now) {
   const canonical = parseRelativeDayPeriod(period);
-  if (canonical === null) throw invalid('A relative-day period of -Nd or -Nday is required.');
+  if (canonical === null) return null;
+  const now = clock();
   const offsetMs = offsetMinutes(timezone) * 60000;
   if (!Number.isFinite(now) || !Number.isFinite(new Date(now).getTime())) throw invalid('Current time is invalid.');
   const days = Number(canonical.slice(1, -3));
@@ -69,8 +75,7 @@ async function openUsageDatabase(path, options) {
 async function readUsageDatabase(sqliteDbPath, openDatabase, read) {
   let db;
   try {
-    const dbPath = sqliteDbPath ?? process.env.COPILOT_API_SQLITE_DB_PATH ??
-      join(homedir(), '.local', 'share', 'copilot-api', 'copilot-api.sqlite');
+    const dbPath = resolveUsageDatabasePath({ sqliteDbPath });
     db = await openDatabase(dbPath, { readOnly: true });
     db.exec('PRAGMA busy_timeout = 1000');
     db.exec('BEGIN');
@@ -91,36 +96,41 @@ async function readUsageDatabase(sqliteDbPath, openDatabase, read) {
   }
 }
 
+export function getUsagePeriod(params) {
+  if (params.has('from') || params.has('to')) throw invalid('from and to are not supported. Use period=-Nd or period=-Nday.');
+  if (params.getAll('period').length > 1) throw invalid('period must be specified at most once.');
+  return params.get('period');
+}
+
 export function createUsageRangeReader({ sqliteDbPath = null, usageTimezone = '+08:00' } = {}, {
   now = () => Date.now(), openDatabase = openUsageDatabase,
 } = {}) {
   return async (pathname, params) => {
-    if (params.has('from') || params.has('to')) throw invalid('from and to are not supported. Use period=-Nd or period=-Nday.');
-    if (params.getAll('period').length > 1) throw invalid('period must be specified at most once.');
-    const period = parseRelativeDayPeriod(params.get('period'));
-    if (period === null) return null;
-    const range = createRelativeDayRange(period, usageTimezone, now());
-    return readUsageDatabase(sqliteDbPath, openDatabase, (db) => {
-      const dataStartMs = db.prepare('SELECT MIN(created_at_ms) AS start_ms FROM token_usage_events').get().start_ms;
-      const base = { period: 'custom', range: rangePayload(range), data_start_ms: dataStartMs };
-      let result;
-      if (pathname === '/token-usage/events' || pathname === '/token-usage/sessions') {
-        result = { ...base, ...getUsagePage(db, range, params, pathname.endsWith('/sessions')) };
-      } else {
-        result = {
-          ...base, byModel: getModelSummaries(db, range),
-          totals: totalsFromRow(getTotalsRow(db, range), getCostRows(db, range)),
-        };
-        if (pathname === '/token-usage/daily') {
-          result.days = [{
-            date: range.date, start_ms: range.startMs, end_ms: range.endMs,
-            byModel: result.byModel, totals: result.totals,
-          }];
-        }
-      }
-      return result;
-    });
+    const range = resolveRelativeDayRange(getUsagePeriod(params), usageTimezone, now);
+    if (range === null) return null;
+    return readUsageRange(pathname, params, range, sqliteDbPath, openDatabase);
   };
+}
+
+export function readUsageRange(pathname, params, range, sqliteDbPath, openDatabase = openUsageDatabase) {
+  return readUsageDatabase(sqliteDbPath, openDatabase, (db) => {
+    const dataStartMs = db.prepare('SELECT MIN(created_at_ms) AS start_ms FROM token_usage_events').get().start_ms;
+    const base = { period: 'custom', range: rangePayload(range), data_start_ms: dataStartMs };
+    if (pathname === '/token-usage/events' || pathname === '/token-usage/sessions') {
+      return { ...base, ...getUsagePage(db, range, params, pathname.endsWith('/sessions')) };
+    }
+    const result = {
+      ...base, byModel: getModelSummaries(db, range),
+      totals: totalsFromRow(getTotalsRow(db, range), getCostRows(db, range)),
+    };
+    if (pathname === '/token-usage/daily') {
+      result.days = [{
+        date: range.date, start_ms: range.startMs, end_ms: range.endMs,
+        byModel: result.byModel, totals: result.totals,
+      }];
+    }
+    return result;
+  });
 }
 
 export function createUsageHourlyReader({ sqliteDbPath = null } = {}, { openDatabase = openUsageDatabase } = {}) {

@@ -6,150 +6,17 @@ import { parseRelativeDayPeriod, UsageRangeError } from '../src/usage-range.mjs'
 import { rewriteUsageViewer, UsageViewerError } from '../src/usage-viewer.mjs';
 import { groups, hourlySummary, tooltips } from './helpers/usage-trends.mjs';
 
-const original = readFileSync(new URL('./fixtures/usage-viewer.upstream.html', import.meta.url));
-// Synthetic measurements in the daily response shape of copilot-api v2.7.43.
+const original = readFileSync(new URL('./fixtures/usage-viewer.v2.9.15.html', import.meta.url));
+// Synthetic measurements in the daily usage response shape.
 const dailyFixture = JSON.parse(readFileSync(new URL('./fixtures/usage-daily.json', import.meta.url)));
 const viewerConfig = { host: '127.0.0.1', port: 43000 };
 const html = rewriteUsageViewer(original, viewerConfig).toString();
-const script = html.slice(html.lastIndexOf('<script>') + '<script>'.length, html.lastIndexOf('</script>'));
-
-function page() {
-  const cells = [];
-  const body = {};
-  let callback;
-  let pending = [];
-  let writes = 0;
-  const notify = (record) => { if (callback) pending.push(record); };
-  const addCell = (text) => {
-    let node;
-    const cell = {
-      get firstChild() { return node; },
-      get textContent() { return node.data; },
-      set textContent(value) { node = { data: value, parentElement: cell }; writes++; notify({ type: 'childList', target: cell }); },
-      set innerHTML(_) { assert.fail('Titles must be written as text'); },
-      closest(selector) { assert.equal(selector, 'td'); return cell; },
-    };
-    node = { data: text, parentElement: cell };
-    cells.push(cell);
-    notify({ type: 'childList', target: body });
-    return cell;
-  };
-  return {
-    addCell,
-    changeTextNode(cell, value) {
-      cell.firstChild.data = value;
-      notify({ type: 'characterData', target: cell.firstChild });
-    },
-    get writes() { return writes; },
-    get observing() { return Boolean(callback); },
-    flush() {
-      for (let count = 0; pending.length && count < 10; count++) {
-        const records = pending;
-        pending = [];
-        callback(records);
-      }
-      assert.equal(pending.length, 0, 'MutationObserver must stop writing after titles are applied');
-    },
-    async run(fetch) {
-      await runInNewContext(script, {
-        fetch,
-        document: { body, querySelectorAll: (selector) => {
-          assert.equal(selector, 'td');
-          return cells;
-        } },
-        MutationObserver: class {
-          constructor(update) { callback = update; }
-          observe(target, options) {
-            assert.equal(target, body);
-            assert.equal(options.childList, true);
-            assert.equal(options.characterData, true);
-            assert.equal(options.subtree, true);
-            assert.ok(!options.attributes);
-          }
-        },
-      });
-    },
-  };
-}
-
-test('usage viewer labels existing, added and reused cells safely without observer loops', async () => {
-  const view = page();
-  const first = view.addCell('  thread-a  ');
-  const unknown = view.addCell('subagent-thread');
-  const partial = view.addCell('prefix-thread-a');
-  const htmlTitle = '</script><img src=x onerror=alert(1)> 中文';
-  await view.run(async (url) => {
-    assert.equal(url, '/__session-titles');
-    return { ok: true, json: async () => ({ 'thread-a': htmlTitle, 'thread-b': '第二个标题' }) };
-  });
-  assert.equal(first.textContent, htmlTitle);
-  assert.equal(first.title, 'thread-a');
-  assert.equal(unknown.textContent, 'subagent-thread');
-  assert.equal(partial.textContent, 'prefix-thread-a');
-  assert.ok(!html.includes(htmlTitle));
-  assert.equal(view.observing, true);
-
-  const added = view.addCell('thread-b');
-  view.flush();
-  assert.equal(added.textContent, '第二个标题');
-  assert.equal(added.title, 'thread-b');
-  const writes = view.writes;
-  view.flush();
-  assert.equal(view.writes, writes);
-
-  first.textContent = 'thread-b';
-  view.flush();
-  assert.equal(first.textContent, '第二个标题');
-  assert.equal(first.title, 'thread-b');
-});
-
-test('a title equal to another known id stays a title after subsequent mutations', async () => {
-  const view = page();
-  const cell = view.addCell('thread-a');
-  await view.run(async () => ({ ok: true, json: async () => ({ 'thread-a': ' thread-b ', 'thread-b': 'other title' }) }));
-  view.addCell('unrelated');
-  view.flush();
-  assert.equal(cell.textContent, ' thread-b ');
-  assert.equal(cell.title, 'thread-a');
-});
-
-test('a colliding title does not hide a new id when the cell is reused', async () => {
-  for (const mode of ['replace-node', 'character-data', 'character-data-and-tooltip']) {
-    const view = page();
-    const cell = view.addCell('thread-a');
-    await view.run(async () => ({ ok: true, json: async () => ({ 'thread-a': 'thread-b', 'thread-b': 'Title for B' }) }));
-    assert.equal(cell.textContent, 'thread-b');
-    if (mode === 'replace-node') cell.textContent = 'thread-b';
-    else {
-      view.changeTextNode(cell, 'thread-b');
-      if (mode === 'character-data-and-tooltip') cell.title = 'thread-b';
-    }
-    view.flush();
-    assert.equal(cell.textContent, 'Title for B');
-    assert.equal(cell.title, 'thread-b');
-  }
-});
-
-test('unavailable or unreadable title responses leave the dashboard usable', async () => {
-  for (const fetch of [
-    async () => { throw new Error('offline'); },
-    async () => ({ ok: false, json: () => assert.fail('Do not decode an error response') }),
-    async () => ({ ok: true, json: async () => { throw new Error('invalid JSON'); } }),
-  ]) {
-    const view = page();
-    const cell = view.addCell('thread-a');
-    await view.run(fetch);
-    view.flush();
-    assert.equal(cell.textContent, 'thread-a');
-    assert.equal(view.writes, 0);
-  }
-});
-
 const tokenUsagePaths = ['/token-usage', '/token-usage/daily', '/token-usage/events', '/token-usage/sessions'];
 
-async function dashboardPage(path, source = html, initialDaily = null, initialHourly = hourlySummary()) {
+async function dashboardPage(path, source = html, initialDaily = null, initialHourly = hourlySummary(), options = {}) {
   const requests = [];
   const requestHeaders = [];
+  const titleRequests = [];
   const history = { pushed: [], replaced: [] };
   const elements = new Map();
   class Element {
@@ -237,11 +104,18 @@ async function dashboardPage(path, source = html, initialDaily = null, initialHo
         return { value: '', textContent: '' };
       },
     },
-    fetch: async (input, options) => {
+    fetch: async (input, init) => {
       const url = new URL(input, window.location);
+      if (url.pathname === '/__session-titles') {
+        titleRequests.push({ url, init });
+        return options.fetchTitles(init.headers);
+      }
       requests.push(url);
-      requestHeaders.push(options?.headers || {});
+      requestHeaders.push(init?.headers || {});
+      if (url.searchParams.get('page') === '2' && options.pageGate) await options.pageGate;
       assert.ok(['/usage', '/models', ...tokenUsagePaths, '/token-usage/hourly'].some((path) => url.pathname.endsWith(path)), url.href);
+      const headers = new Headers();
+      if (options.isolated && !url.pathname.endsWith('/hourly')) headers.set('x-api-key-usage-isolated', 'true');
       if (url.pathname.endsWith('/token-usage/hourly')) {
         const payload = structuredClone(hourly);
         const failure = hourlyFailure;
@@ -249,7 +123,7 @@ async function dashboardPage(path, source = html, initialDaily = null, initialHo
         hourlyGate = null;
         if (pending) await pending;
         if (failure) throw new Error(failure);
-        return { ok: true, json: async () => payload };
+        return { ok: true, headers, json: async () => payload };
       }
       if (url.pathname === '/token-usage/daily') {
         if (dailyGate) await dailyGate;
@@ -259,15 +133,19 @@ async function dashboardPage(path, source = html, initialDaily = null, initialHo
         range, totals: emptyTotals, byModel: [], days: [], items: [],
         page: Number(url.searchParams.get('page') || 1), total: 0, total_pages: 1,
       };
+      if (options.sessions && /\/(events|sessions)$/.test(url.pathname)) {
+        empty.items = options.sessions.map((id) => ({ ...emptyTotals, model: id, session_id: id }));
+      }
       const payload = url.pathname === '/usage' ? { quota_snapshots: {} } : url.pathname === '/models' ? { data: [] }
         : url.pathname === '/token-usage/daily' && daily ? daily : empty;
-      return { ok: true, json: async () => payload };
+      return { ok: true, headers, json: async () => payload };
     },
     console: { warn() {}, error() {} },
   };
   const upstreamScript = source.match(/<script>([\s\S]*?)<\/script>/)?.[1];
-  assert.ok(upstreamScript?.includes('        init();'), 'Fixture must execute the real upstream init');
-  const instrumented = upstreamScript.replace('        init();', `
+  const startApp = /\binit\s*\(\s*\)\s*;(?=\s*\}\s*\)\s*;?\s*$)/;
+  assert.ok(startApp.test(upstreamScript), 'Fixture must execute the real upstream init');
+  const instrumented = upstreamScript.replace(startApp, `
         globalThis.viewer = {
           state, normalizePeriod, getSelectedPeriod, syncUrlState, resolveUsageUrl, deriveEndpointUrl,
           buildTokenUsageSummaryUrl, buildTokenUsageDailyUrl, buildTokenUsageEventsUrl,
@@ -280,7 +158,7 @@ async function dashboardPage(path, source = html, initialDaily = null, initialHo
   const settle = () => new Promise(setImmediate);
   await settle();
   return {
-    requests, requestHeaders, history, select, viewer: sandbox.viewer,
+    requests, requestHeaders, titleRequests, history, select, viewer: sandbox.viewer,
     get state() { return sandbox.viewer.state; },
     get url() { return window.location; },
     get rendered() { return elements.get('content-area').innerHTML; },
@@ -343,7 +221,14 @@ async function dashboardPage(path, source = html, initialDaily = null, initialHo
       elements.get('endpoint-url').value = endpoint;
       elements.get('endpoint-url').dispatch('change');
     },
-    setCredential(value) { elements.get('x-api-key').value = value; },
+    typeEndpoint(endpoint) {
+      elements.get('endpoint-url').value = endpoint;
+      elements.get('endpoint-url').dispatch('input');
+    },
+    setCredential(value) {
+      elements.get('x-api-key').value = value;
+      elements.get('x-api-key').dispatch('input');
+    },
     async submit() {
       elements.get('endpoint-form').dispatch('submit', { preventDefault() {} });
       await settle();
@@ -365,6 +250,138 @@ function assertTokenUsageRequests(requests, period, paths = tokenUsagePaths) {
     assert.equal(url.searchParams.has('to'), false, url.href);
   }
 }
+
+test('the dashboard renders matched session IDs as escaped titles in session and event rows', async () => {
+  const view = await dashboardPage('?period=-1d&endpoint=/usage', html, dailyFixture, undefined, {
+    sessions: ['thread-a', 'thread-b', 'unknown'],
+    fetchTitles: async () => Response.json({ 'thread-a': 'thread-b', 'thread-b': '<script>标题</script>' }),
+  });
+  assertTokenUsageRequests(view.requests, '-1day');
+  assertTrendPanelOrder(view.rendered);
+  assert.equal(view.titleRequests.length, 1);
+  assert.equal((view.rendered.match(/title="thread-a">thread-b<\/td>/g) ?? []).length, 2);
+  assert.equal((view.rendered.match(/title="thread-b">&lt;script&gt;标题&lt;\/script&gt;<\/td>/g) ?? []).length, 2);
+  // The model column of the event table can contain the same string as a session ID.
+  assert.match(view.rendered, /title="thread-a">thread-a<\/td>/);
+  assert.match(view.rendered, /title="unknown">unknown<\/td>/);
+  await view.selectPeriod('today');
+  assert.equal(view.requests.filter((url) => url.pathname.endsWith('/hourly')).length, 1);
+  assert.match(outputSpeedPanel(view.rendered), /data-output-speed-chart/);
+});
+
+test('session titles use the current same-origin credential and ignore late responses from another account', async () => {
+  let release;
+  const pending = new Promise((resolve) => { release = resolve; });
+  const view = await dashboardPage('?period=today&endpoint=/usage', html, dailyFixture, undefined, {
+    sessions: ['session-id'],
+    fetchTitles: async (headers) => headers.authorization === 'Bearer second'
+      ? Response.json({ 'session-id': 'second account' }) : pending,
+  });
+  assert.match(view.rendered, /title="session-id">session-id<\/td>/);
+  view.setCredential('Bearer second');
+  await view.submit();
+  assert.equal(view.titleRequests.at(-1).init.headers.authorization, 'Bearer second');
+  assert.match(view.rendered, /title="session-id">second account<\/td>/);
+  release(Response.json({ 'session-id': 'first account' }));
+  await new Promise(setImmediate);
+  assert.doesNotMatch(view.rendered, /first account/);
+  const titleCount = view.titleRequests.length;
+  view.setEndpoint('https://another.test/usage');
+  view.setCredential('Bearer other-origin');
+  await view.submit();
+  assert.equal(view.titleRequests.length, titleCount);
+  assert.doesNotMatch(view.rendered, /first account|second account/);
+  assert.match(view.rendered, /title="session-id">session-id<\/td>/);
+});
+
+test('unavailable titles leave raw session IDs usable and can recover on refresh', async () => {
+  let response = () => { throw new Error('offline'); };
+  const view = await dashboardPage('?period=today&endpoint=/usage', html, dailyFixture, undefined, {
+    sessions: ['thread-id'], fetchTitles: async () => response(),
+  });
+  for (const unavailable of [() => new Response(null, { status: 403 }), () => new Response('invalid JSON')]) {
+    assert.match(view.rendered, /title="thread-id">thread-id<\/td>/);
+    response = unavailable;
+    await view.submit();
+  }
+  assert.match(view.rendered, /title="thread-id">thread-id<\/td>/);
+  response = () => Response.json({ 'thread-id': 'recovered' });
+  await view.submit();
+  assert.match(view.rendered, /title="thread-id">recovered<\/td>/);
+});
+
+test('editing an external endpoint back to the proxy does not send its still-visible key to the title endpoint', async () => {
+  const view = await dashboardPage('?period=today&endpoint=https://another.test/usage', html, dailyFixture, undefined, {
+    sessions: ['thread-a'], fetchTitles: async () => Response.json({ 'thread-a': 'local title' }),
+  });
+  view.setCredential('Bearer external');
+  await view.submit();
+  view.typeEndpoint('/usage');
+  assert.equal(view.titleRequests.length, 0);
+  await view.submit();
+  assert.equal(view.titleRequests.length, 1);
+  assert.equal(view.titleRequests[0].init.headers.authorization, undefined);
+});
+
+test('editing a connection clears usage immediately and discards late refresh and pagination results', async () => {
+  for (const edit of ['credential', 'endpoint']) {
+    const options = { sessions: ['previous-session'], fetchTitles: async () => Response.json({}) };
+    const view = await dashboardPage('?period=today&endpoint=/usage',
+      html, dailyFixture, hourlySummary({ 12: { previous: 13 } }), options);
+    assert.match(view.rendered, /previous: 13/);
+    const finishRefresh = view.pauseHourly();
+    await view.submit();
+    let finishPages;
+    options.pageGate = new Promise((resolve) => { finishPages = resolve; });
+    const pages = [view.viewer.fetchTokenUsageEventsPage(2), view.viewer.fetchTokenUsageSessionsPage(2)];
+    const count = view.requests.length;
+    if (edit === 'credential') view.setCredential('Bearer changed');
+    else view.typeEndpoint('/another/usage');
+    const assertCleared = () => {
+      for (const field of ['tokenUsageSummary', 'tokenUsageDailySummary', 'tokenUsageHourlySummary', 'tokenUsageEventsPage', 'tokenUsageSessionsPage']) {
+        assert.equal(view.state[field], null, field);
+      }
+      assert.doesNotMatch(view.rendered, /previous: 13|previous-session/);
+    };
+    assertCleared();
+    finishPages();
+    await Promise.all(pages);
+    await finishRefresh();
+    assertCleared();
+    assert.equal(view.requests.length, count, 'a stale refresh must not start another sessions request');
+    await view.submit();
+    assert.match(view.rendered, /previous: 13/);
+  }
+});
+
+test('a late global hourly response cannot restore data after upstream key isolation takes effect', async () => {
+  const options = { sessions: ['private-session'], fetchTitles: async () => Response.json({ 'private-session': 'old title' }) };
+  const globalHourly = hourlySummary({ 12: { 'global-model': 877 } });
+  const view = await dashboardPage('?period=today&endpoint=/usage', html, dailyFixture, globalHourly, options);
+  assert.match(view.rendered, /title="private-session">old title<\/td>/);
+  assert.match(outputSpeedPanel(view.rendered), /global-model: 877/);
+  options.isolated = true;
+  const release = view.pauseHourly();
+  await view.submit();
+  const titleCount = view.titleRequests.length;
+  assert.equal(view.state.isolateApiKeyUsage, true);
+  await release();
+  assert.equal(view.state.isolateApiKeyUsage, true);
+  assert.equal(view.titleRequests.length, titleCount);
+  assert.doesNotMatch(view.rendered, /old title/);
+  assert.match(view.rendered, /title="private-session">private-session<\/td>/);
+  assert.equal(view.state.tokenUsageHourlySummary, null);
+  assert.match(outputSpeedPanel(view.rendered), /unavailable for isolated API keys/i);
+  assert.doesNotMatch(outputSpeedPanel(view.rendered), /global-model|data-output-speed-chart/);
+
+  view.failHourly('upstream denied this key');
+  await view.submit();
+  assert.match(outputSpeedPanel(view.rendered), /upstream denied this key/);
+  options.isolated = false;
+  view.setHourly(globalHourly);
+  await view.submit();
+  assert.match(outputSpeedPanel(view.rendered), /global-model: 877/);
+});
 
 test('pinned upstream page reproduces fallback to Today before rewriting', async () => {
   const view = await dashboardPage('?period=-1%20Day&endpoint=%2Fusage', original.toString());
@@ -416,7 +433,7 @@ test('plus decoding, select changes, form refresh, tabs, pagination and reload r
   await view.submit();
   assertTokenUsageRequests(view.requests, '-34day');
   assert.equal(view.requests.filter((url) => url.pathname === '/usage').length, 0,
-    'v2.7.43 loads account allowances separately in the Subscriptions tab');
+    'copilot-api loads account allowances separately in the Subscriptions tab');
 
   view.requests.length = 0;
   await view.selectTab('models');
@@ -459,6 +476,31 @@ test('relative URLs without an endpoint retain the selected option until the use
   await view.submit();
   assertTokenUsageRequests(view.requests, '-10day');
   assert.equal(view.requests.find((url) => url.pathname === '/token-usage').origin, 'http://127.0.0.1:43000');
+});
+
+test('default usage and titles stay on the page loopback alias, and explicit cross-origin endpoints keep their own credentials', async () => {
+  for (const [page, endpoint, expectedOrigin, titles] of [
+    ['http://localhost:43000', '', 'http://localhost:43000', true],
+    ['http://[::1]:43000', '', 'http://[::1]:43000', true],
+    ['http://localhost:43001', '', 'http://127.0.0.1:43000', false],
+    ['http://example.test:43000', '', 'http://127.0.0.1:43000', false],
+    ['http://localhost:43000', '?endpoint=http://127.0.0.1:43000/usage', 'http://127.0.0.1:43000', false],
+  ]) {
+    const view = await dashboardPage(page + '/usage-viewer' + endpoint, html, dailyFixture, undefined, {
+      sessions: ['thread-a'], fetchTitles: async () => Response.json({ 'thread-a': 'local title' }),
+    });
+    view.setCredential('Bearer dashboard-test');
+    await view.submit();
+    assert.ok(view.requests.every((url) => url.origin === expectedOrigin));
+    if (titles) {
+      assert.equal(view.titleRequests.at(-1).url.origin, page);
+      assert.equal(view.titleRequests.at(-1).init.headers.authorization, 'Bearer dashboard-test');
+      assert.match(view.rendered, /title="thread-a">local title<\/td>/);
+    } else {
+      assert.equal(view.titleRequests.length, 0);
+      assert.match(view.rendered, /title="thread-a">thread-a<\/td>/);
+    }
+  }
 });
 
 test('built-in periods and legacy aliases keep their upstream selection and request behavior', async () => {
@@ -561,7 +603,7 @@ function assertTrendPanelOrder(rendered) {
   }
 }
 
-test('real v2.7.43 render flow places independent speed and cost panels after the original for native and relative periods', async () => {
+test('real dashboard render flow places independent speed and cost panels after the original for native and relative periods', async () => {
   for (const period of ['this_week', 'last_7_days', 'this_month', 'last_30_days', 'lifetime', '-1d', '-34day']) {
     const view = await dashboardPage(`?period=${period}&endpoint=%2Fusage`, html, dailyFixture);
     assertTrendPanelOrder(view.rendered);
@@ -924,83 +966,41 @@ test('older hourly requests cannot restore stale data or errors after period, en
 });
 
 const originalText = original.toString();
-function upstreamFunction(name) {
-  const start = originalText.indexOf(`function ${name}(`);
-  return originalText.slice(start, originalText.indexOf('\n        }', start) + '\n        }'.length);
-}
-
-const selectStart = originalText.indexOf('<select');
-const bindingStart = originalText.indexOf('const tokenUsagePeriodSelect =');
-const initStart = originalText.indexOf('const periodFromUrl =');
-const initEnd = 'const initialEndpoint = endpointFromUrl || DEFAULT_ENDPOINT;';
-const requiredMarkers = [
-  ['default endpoint', 'const DEFAULT_ENDPOINT = "http://localhost:4141/usage";'],
-  ['period select', originalText.slice(selectStart, originalText.indexOf('>', selectStart) + 1)],
-  ['period select binding', originalText.slice(bindingStart, originalText.indexOf(');', bindingStart) + 2)],
-  ['period normalization', upstreamFunction('normalizePeriod')],
-  ['usage endpoint validation', upstreamFunction('resolveUsageUrl')],
-  ['derived endpoint validation', upstreamFunction('deriveEndpointUrl')],
-  ['period initialization', originalText.slice(initStart, originalText.indexOf(initEnd, initStart) + initEnd.length)],
-  ['range label', 'const label = labels[period] || labels.today;'],
-  ['daily trend renderer', 'function renderTokenUsageDailyTrend(dailySummary, error) {'],
-  ['daily trend panels', '${renderTokenUsageDailyTrend(\n                dailySummary,\n                state.tokenUsageDailyError\n              )}'],
-  ['cost amount reader', 'function getCostAmount(cost) {'],
-  ['trend range formatter', 'function renderTokenUsageRangeText(period, range) {'],
-  ['trend date formatter', 'function formatChartDate(value) {'],
-  ['trend empty state', 'function renderEmptyState(message) {'],
-  ['trend click binding', 'contentArea.addEventListener("click", handleContentAreaClick);'],
-  ['trend refresh display', 'if (state.isLoading) {'],
-  ['hourly content visibility', 'const hasContent = Boolean(state.isTokenUsageLoading || state.isEventsLoading'],
-  ['hourly section visibility', 'const hasTokenUsageContent = Boolean('],
-  ['trend request identity', 'async function fetchTokenUsageSummaryAndEvents(page = 1) {'],
-  ['hourly invalid endpoint', 'if (!endpoint) {\n            state.tokenUsageDailySummary = null;'],
-  ['trend refresh data', 'const period = getSelectedPeriod();\n          state.isTokenUsageLoading = true;\n          state.tokenUsageDailySummary = null;'],
-  ['hourly request', `const [summaryResult, dailyResult, eventsResult] =
-              await Promise.allSettled([
-                fetchJson(buildTokenUsageSummaryUrl(usageUrl, period)),
-                fetchJson(buildTokenUsageDailyUrl(usageUrl, period)),
-                fetchJson(buildTokenUsageEventsUrl(usageUrl, period, page)),
-              ]);`],
-  ['hourly request error', 'console.error("Token usage fetch error:", error);'],
-  ['trend request completion', 'state.isTokenUsageLoading = false;\n            render("usage");'],
-  ['closing body', '</body>'],
-];
-
-test('every required upstream marker must occur exactly once', () => {
-  for (const [name, marker] of requiredMarkers) {
-    assert.ok(marker.length, name);
-    for (const [reason, source] of [
-      ['missing', originalText.replace(marker, '')],
-      ['duplicated', `${originalText}\n${marker}`],
-    ]) {
-      assert.throws(() => rewriteUsageViewer(Buffer.from(source), viewerConfig), (error) =>
-        error instanceof UsageViewerError && error.status === 502 && error.code === 'proxy_usage_viewer_incompatible'
-        && error.message.includes(name) && error.message.includes(reason), `${name}: ${reason}`);
-    }
-  }
-});
-
-test('a renamed period select or binding is reported as incompatible', () => {
-  for (const source of [
-    originalText.replace('id="token-usage-period"', 'id="renamed-period"'),
-    originalText.replace('          "token-usage-period"', '          "renamed-period"'),
-  ]) {
-    assert.throws(() => rewriteUsageViewer(Buffer.from(source), viewerConfig), (error) =>
-      error instanceof UsageViewerError && /period select.*missing/.test(error.message));
-  }
-});
-
-test('CRLF upstream pages are supported and mixed-ending duplicate markers still fail', async () => {
-  const rewritten = rewriteUsageViewer(Buffer.from(originalText.replaceAll('\n', '\r\n')), viewerConfig).toString();
-  const view = await dashboardPage('?period=-10+Day&endpoint=%2Fusage', rewritten, dailyFixture);
-  assert.equal(view.select.value, '-10day');
-  assertTokenUsageRequests(view.requests, '-10day');
+test('formatting changes in the upstream dashboard preserve initialization, refresh and pagination', async () => {
+  const formatted = originalText
+    .replace('function syncTokenUsageConnection() {', 'function syncTokenUsageConnection /* connection */ () {')
+    .replace('        init();', '        const proxyUsage = null, totalTrendMetric = null;\n        init();')
+    .replace('if (!isCurrentRequest()) return;\n\n            if (summaryResult', 'if (!isCurrentRequest()) return;\n\n\n            if (summaryResult')
+    .replace('Promise.allSettled([', 'Promise /* scheduling */ . allSettled( [')
+    .replace('Token usage fetch error:', 'Could not load token usage:')
+    .replace('fetchTokenUsageSessionsPage(page)', 'fetchTokenUsageSessionsPage( page )')
+    .replace('</body>', '</BODY>').replaceAll('\n', '\r\n');
+  const source = rewriteUsageViewer(Buffer.from(formatted), viewerConfig).toString();
+  const view = await dashboardPage('?period=-1d&endpoint=/usage', source, dailyFixture);
+  assert.equal(view.select.value, '-1day');
   assertTrendPanelOrder(view.rendered);
-  for (const [name, marker] of requiredMarkers.filter(([, marker]) => marker.includes('\n'))) {
-    const duplicate = originalText + marker.replaceAll('\n', '\r\n');
-    assert.throws(() => rewriteUsageViewer(Buffer.from(duplicate), viewerConfig), (error) =>
-      error instanceof UsageViewerError && error.message.includes(`${name} marker is duplicated`));
+  await view.selectPeriod('today');
+  assert.match(outputSpeedPanel(view.rendered), /data-output-speed-chart/);
+  await view.viewer.fetchTokenUsageEventsPage(2);
+  assert.equal(view.requests.at(-1).searchParams.get('page'), '2');
+});
+
+test('missing or ambiguous integration points fail before serving the page', () => {
+  for (const [label, source] of [
+    ['period select', originalText.replace('id="token-usage-period"', 'id="renamed"')],
+    ['period select binding', originalText.replace('          "token-usage-period"', '          "renamed"')],
+    ['initializer for DEFAULT_ENDPOINT', originalText.replace('const DEFAULT_ENDPOINT = "http://localhost:4141/usage";', 'let DEFAULT_ENDPOINT;')],
+    ['renderTokenUsageDailyTrend', originalText.replace('function renderTokenUsageDailyTrend(', 'function changedTrend(')],
+    ['daily trend slot', originalText.replace('${renderTokenUsageDailyTrend(', '${changedTrend(')],
+    ['init call', originalText.replace('        init();', '        init(); init();')],
+    ['usage request batch', originalText.replace('await Promise.allSettled([\n                fetchJson(buildTokenUsageSummaryUrl', 'await Promise.all([\n                fetchJson(buildTokenUsageSummaryUrl')],
+  ]) {
+    assert.throws(() => rewriteUsageViewer(Buffer.from(source), viewerConfig), error =>
+      error instanceof UsageViewerError && error.status === 502 && error.message.includes(label), label);
   }
+  // Text outside the dashboard script is never a second integration point.
+  const text = '<p>function renderTokenUsageDailyTrend(dailySummary, error) {</p>';
+  assert.ok(rewriteUsageViewer(Buffer.from(originalText + text), viewerConfig).toString().endsWith(text));
 });
 
 test('rewriting preserves arbitrary source bytes outside its ASCII edits', () => {

@@ -10,9 +10,12 @@ import { createProxyServer } from '../src/server.mjs';
 import { createUsageDb } from './helpers/usage-db.mjs';
 
 const routes = ['/token-usage', '/token-usage/daily', '/token-usage/events', '/token-usage/sessions'];
-const viewerHtml = readFileSync(new URL('./fixtures/usage-viewer.upstream.html', import.meta.url));
+const scopePath = '/token-usage/events?period=today&page_size=1';
+const viewerHtml = readFileSync(new URL('./fixtures/usage-viewer.v2.9.15.html', import.meta.url));
 
-async function serve(t, config, responseBody = (url) => JSON.stringify({ forwarded: url })) {
+const todayPage = JSON.stringify({ period: 'today', range: { start_ms: 0, end_ms: 100 }, items: [] });
+
+async function serve(t, config, responseBody = url => url === scopePath ? todayPage : JSON.stringify({ forwarded: url })) {
   const requests = [];
   const listen = async (server) => {
     server.listen(0, '127.0.0.1');
@@ -43,6 +46,25 @@ async function missingDatabase(t) {
   t.after(() => rm(directory, { recursive: true, force: true }));
   return join(directory, 'missing.sqlite');
 }
+
+test('relative-day queries keep the day selected before upstream authorization crosses midnight', async (t) => {
+  const midnight = Date.parse('2026-11-18T16:00:00Z');
+  t.mock.timers.enable({ apis: ['Date'], now: midnight - 1 });
+  const fixture = await createUsageDb(t, [
+    { created_at_ms: midnight - 2 * 86400000, total_tokens: 17 },
+    { created_at_ms: midnight - 86400000, total_tokens: 18 },
+  ]);
+  const env = await serve(t, { sqliteDbPath: fixture.path, usageTimezone: '+08:00' }, () => {
+    t.mock.timers.tick(1);
+    return todayPage;
+  });
+  const result = await fetch(env.url + '/token-usage/daily?period=-1d');
+  assert.equal(result.status, 200);
+  const daily = await result.json();
+  assert.deepEqual(daily.days.map(day => day.date), ['2026-11-17']);
+  assert.equal(daily.totals.total_tokens, 17);
+  assert.deepEqual(env.requests, [scopePath]);
+});
 
 test('four HTTP usage endpoints select the same day beyond ten days ago in each timezone', async (t) => {
   t.mock.timers.enable({ apis: ['Date'], now: Date.parse('2026-11-04T12:00:00Z') });
@@ -87,7 +109,7 @@ test('four HTTP usage endpoints select the same day beyond ten days ago in each 
           assert.deepEqual(body.days[0].totals, body.totals);
         }
       }
-      assert.equal(env.requests.length, 0);
+      assert.deepEqual(env.requests, routes.map(() => scopePath));
     });
   }
 });
@@ -117,7 +139,8 @@ test('relative-day aliases and arbitrary day counts agree across all four HTTP e
       }
     }
   }
-  assert.equal(env.requests.length, 0);
+  assert.equal(env.requests.length, 5 * 10 * routes.length);
+  assert.ok(env.requests.every((path) => path === scopePath));
 });
 
 test('invalid periods and explicit date parameters fail locally even without a database', async (t) => {
@@ -188,7 +211,7 @@ test('the 1970 local-date boundary applies to all endpoints and the viewer befor
         assert.equal(body.error.type, 'invalid_request_error');
         assert.match(body.error.message, /1970-01-01/);
       }
-      assert.deepEqual(env.requests, [pagePath]);
+      assert.deepEqual(env.requests, [...routes.map(() => scopePath), pagePath]);
     });
   }
 });
@@ -200,7 +223,7 @@ test('relative usage returns 501 on all endpoints when SQLite is unavailable', a
     assert.equal(response.status, 501, route);
     assert.equal((await response.json()).error.type, 'usage_range_unavailable');
   }
-  assert.equal(env.requests.length, 0);
+  assert.deepEqual(env.requests, routes.map(() => scopePath));
 });
 
 test('ordinary periods keep their complete upstream URLs without requiring SQLite', async (t) => {
@@ -275,7 +298,8 @@ test('relative usage supports loopback CORS, including preflight and local error
     const response = await fetch(`${env.url}/token-usage?period=-1day`, { headers: { origin } });
     assert.equal(response.headers.get('access-control-allow-origin'), null);
   }
-  assert.equal(env.requests.length, 0);
+  assert.ok(env.requests.every((path) => path === scopePath));
+  assert.equal(env.requests.length, 3 * routes.length + 4);
 
   const unavailable = await serve(t, { sqliteDbPath: await missingDatabase(t) });
   const origin = 'http://localhost:43000';
@@ -288,5 +312,5 @@ test('relative usage supports loopback CORS, including preflight and local error
     const preflight = await fetch(`${unavailable.url}${route}?period=-1day`, { method: 'OPTIONS', headers: { origin } });
     assert.equal(preflight.status, 204, 'Preflight must not open SQLite');
   }
-  assert.equal(unavailable.requests.length, 0);
+  assert.deepEqual(unavailable.requests, routes.map(() => scopePath));
 });

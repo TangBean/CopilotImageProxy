@@ -5,7 +5,7 @@ import { DatabaseSync } from 'node:sqlite';
 
 export async function createUsageDb(t, rows = [], { wal = false } = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'copilot-usage-range-'));
-  const path = join(directory, 'usage.sqlite');
+  const path = join(directory, 'copilot-api.sqlite');
   const db = new DatabaseSync(path);
   t.after(async () => {
     if (db.isOpen) db.close();
